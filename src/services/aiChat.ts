@@ -1,0 +1,1213 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Jinny AI Chat Service — Full NLP Pipeline v2
+// Streaming chat + intent classification, over either backend:
+//   • Groq, model from lib/groqModels.ts (hosted, default)
+//   • WebLLM on WebGPU (on-device, private, works offline once cached)
+// The backend is the user's choice — see lib/aiProvider.ts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { supabase } from "@/integrations/supabase/client";
+import { cityToIATA } from "@/lib/iata";
+import { formatLocalDate } from "@/lib/date";
+import { formatMoney, formatMoneyTotals, parseBudgetInput } from "@/lib/currency";
+import { loadTripBudgets } from "@/services/tripBudget";
+import { getAIProvider, hasWebGPUAPI } from "@/lib/aiProvider";
+import { isSupabaseConfigured } from "@/integrations/supabase/client";
+import { groqProxyFetch } from "@/services/groqProxy";
+import {
+  GROQ_MODEL,
+  groqErrorCode,
+  groqMaxTokens,
+  groqModelParams,
+} from "@/lib/groqModels";
+
+// Re-exported so existing importers of `cityToIATA` from this module keep working.
+export { cityToIATA };
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Intent types
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type Intent =
+  | "NAVIGATE"
+  | "CREATE_TRIP"
+  | "SEARCH_FLIGHTS"
+  | "SEARCH_HOTELS"
+  | "CHECK_WEATHER"
+  | "CHECK_TRAFFIC"
+  | "GET_ROUTE"
+  | "OPEN_MAPS"
+  | "BUDGET_ANALYSIS"
+  | "EXPLORE"
+  | "GUIDE"
+  | "SOS"
+  | "GREETING"
+  | "CANCEL_TRIP"
+  | "SHARE_TRIP"
+  | "CURRENCY"
+  | "PACKING"
+  | "VISA"
+  | "APP_CONTROL"
+  | "GENERAL_CHAT";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Expanded intent patterns — richer coverage, ordered by specificity
+// ─────────────────────────────────────────────────────────────────────────────
+
+const INTENT_PATTERNS: Array<{ intent: Intent; patterns: RegExp[] }> = [
+  // ── Greeting ──────────────────────────────────────────────────────────────
+  {
+    intent: "GREETING",
+    patterns: [
+      /^(hi+|hello+|hey+|howdy|sup|what'?s up|good\s*(morning|evening|afternoon|night)|namaste|namaskar|yo|hola|hiya|greetings)\b/i,
+      /^(hey jinny|ok jinny|okay jinny|oi jinny|hi jinny|hello jinny|jinny)\s*[,!.]?\s*$/i,
+      /^jinny\s*(are you there|you there|wake up|hello|hi|hey)\b/i,
+    ],
+  },
+
+  // ── SOS / Emergency — check BEFORE others so it never gets misclassified ──
+  {
+    intent: "SOS",
+    patterns: [
+      /\b(sos|emergency|mayday|call\s*(for\s*)?help|i\s*(need|am)\s*(help|in danger|hurt|injured|lost|stranded|stuck)|danger|unsafe|in\s*trouble|accident|ambulance|police\s*now|fire\s*now|medical\s*(emergency|help)|save\s*me|can'?t\s*breathe)\b/i,
+    ],
+  },
+
+  // ── Navigate ──────────────────────────────────────────────────────────────
+  {
+    intent: "NAVIGATE",
+    patterns: [
+      /\b(go\s*to|open|show\s*me|take\s*me\s*to|navigate\s*to|switch\s*to|launch|visit|jump\s*to)\b.*(dashboard|home\s*page?|itinerary|my\s*trips?|trips?|explore|friends|profile|guide|community|settings|planner)/i,
+      /\b(dashboard|go\s*home|open\s*home|my\s*home)\b/i,
+      /\b(back\s*to\s*(home|dashboard)|main\s*(page|screen))\b/i,
+    ],
+  },
+
+  // ── Operate the app ───────────────────────────────────────────────────────
+  // Commands that change something or drive the screen. Checked before the
+  // budget, cancel and share intents, whose hints would otherwise steer
+  // "add a 500 rupee lunch" toward a budget summary and "delete my Goa trip"
+  // toward merely opening the trips page.
+  {
+    intent: "APP_CONTROL",
+    patterns: [
+      /\b(click|tap|press|hit|scroll|type|fill\s*in|submit|go\s*back|sign\s*out|log\s*out|tick|untick|toggle|mute|unmute|enable|disable|turn\s*(on|off))\b/i,
+      /\b(add|log|record|note|put)\b.{0,40}\b(expense|spent|paid|bill)\b/i,
+      // "I paid 1200 for the cab" — an amount follows, unlike "how much have I spent?"
+      /\b(i|we)\s+(just\s+)?(spent|paid)\s+(?:₹|rs\.?\s*|inr\s*|\$|€|£|\d)/i,
+      /\b(delete|remove|drop|cancel)\b.{0,40}\b(expense|trip|activity|from\s+(my|the)\s+(plan|itinerary))\b/i,
+      /\b(add|put|schedule|move)\b.{0,60}\b(day\s*\d+|itinerary|my\s+plan|to\s+(my|the)\s+trip)\b/i,
+      /\b(rename|change|update|set|edit|increase|decrease|raise|lower)\b.{0,40}\b(trip|budget|dates?|trip\s+name|preferences?|pace|language)\b/i,
+      /\b(message|text|dm)\s+[a-z]+/i,
+      /\b(send|post)\b.{0,20}\b(message|text)\b|\btell\s+the\s+group\b/i,
+      /\b(invite|add)\b.{0,40}\bto\s+(my|the|our)\b.{0,20}\btrip\b|\binvite\s+link\b/i,
+      /\b(accept|reject|decline)\b.{0,30}\b(friend|request)\b|\bfriend\s*request\b/i,
+      /\b(join|leave)\b.{0,30}\bcommunit/i,
+      /\b(export|download)\b.{0,20}\b(pdf|itinerary)\b|\bsave\b.{0,30}\boffline\b/i,
+      /\b(switch|change)\s+(the\s+)?language\b|\bspeak\s+(in\s+)?(hindi|english|tamil|telugu|marathi|bengali|gujarati|kannada|malayalam|punjabi|french|spanish|german)\b/i,
+    ],
+  },
+
+  // ── Create trip ───────────────────────────────────────────────────────────
+  {
+    intent: "CREATE_TRIP",
+    patterns: [
+      /\b(plan|create|make|book|start|schedule|organise|organize|set\s*up|build|arrange)\b.*(trip|travel|visit|vacation|holiday|journey|tour|getaway|excursion|weekend)/i,
+      /\b(i\s*(want|would like|wanna|d like)\s*to\s*(go|travel|visit|explore))\b/i,
+      /\b(i'?m?\s*(going|planning|thinking)\s*(to|of\s*going\s*to))\b/i,
+      /\b(trip\s*to|travel\s*to|visit(ing)?|vacation\s*in|holiday\s*in)\s+[A-Z][a-z]/,
+      /\b(let'?s\s*(go\s*to|plan|visit)|take\s*me\s*(on\s*a\s*trip|to))\b/i,
+    ],
+  },
+
+  // ── Flights ───────────────────────────────────────────────────────────────
+  {
+    intent: "SEARCH_FLIGHTS",
+    patterns: [
+      /\b(search|find|book|show|get|check|look\s*for)\b.*(flights?|airfare|plane\s*tickets?|fly|flying|air\s*travel)/i,
+      /\bflights?\b.*(from|to|between|departing|arriving)/i,
+      /\b(flying|fly(ing)?)\s*(from|to)\b/i,
+      /\b(cheap(est)?\s*flights?|direct\s*flights?|one.way|round.trip\s*flights?)\b/i,
+      /\bfrom\s+\w+\s+to\s+\w+\s+(flight|fly|ticket)/i,
+    ],
+  },
+
+  // ── Hotels ────────────────────────────────────────────────────────────────
+  {
+    intent: "SEARCH_HOTELS",
+    patterns: [
+      /\b(search|find|book|show|get|check|look\s*for)\b.*(hotels?|stay|accommodation|hostel|resort|room|lodge|guesthouse|airbnb|motel|inn)\b/i,
+      /\bwhere\s+(to\s*stay|can\s*i\s*stay|should\s*i\s*stay)\b/i,
+      /\bhotels?\s*(in|at|near|around)\b/i,
+      /\b(cheap(est)?\s*hotels?|luxury\s*hotels?|budget\s*(hotels?|stay))\b/i,
+      /\bneed\s+a\s+(room|place\s*to\s*stay|hotel|bed)\b/i,
+    ],
+  },
+
+  // ── Weather ───────────────────────────────────────────────────────────────
+  {
+    intent: "CHECK_WEATHER",
+    patterns: [
+      /\b(weather|forecast|climate|temperature|rain|snow|sunny|cloudy|humidity|monsoon|storm|heat|cold|wind)\b/i,
+      /\bhow'?s?\s*(the\s*)?weather\b/i,
+      /\bwill\s*it\s*(rain|snow|be\s*(sunny|hot|cold|windy))\b/i,
+      /\bweather\s*(in|at|for|during)\b/i,
+      /\bshould\s*i\s*(bring|pack|carry)\b.*(umbrella|jacket|raincoat|sunscreen)/i,
+    ],
+  },
+
+  // ── Traffic ───────────────────────────────────────────────────────────────
+  {
+    intent: "CHECK_TRAFFIC",
+    patterns: [
+      /\b(traffic|congestion|road\s*conditions?|road\s*block|jam|gridlock)\b/i,
+      /\bhow'?s?\s*(the\s*)?traffic\b/i,
+      /\b(is\s*the\s*road|are\s*the\s*roads)\b/i,
+      /\b(rush\s*hour|peak\s*hours?|highway\s*conditions?)\b/i,
+    ],
+  },
+
+  // ── Route / directions ────────────────────────────────────────────────────
+  {
+    intent: "GET_ROUTE",
+    patterns: [
+      /\b(directions?\s*to|how\s*(do\s*i|to)\s*get\s*to|route\s*to|show\s*(me\s*)?the\s*way|best\s*way\s*to\s*get)\b/i,
+      /\bhow\s*far\s*is\b/i,
+      /\bget\s*(me\s*)?there\b/i,
+      /\b(walking|driving|cycling)\s*(route|directions?|path)\b/i,
+      /\b(distance\s*(from|to|between)|how\s*long\s*(to\s*drive|to\s*walk|does\s*it\s*take))\b/i,
+    ],
+  },
+
+  // ── Maps navigation ───────────────────────────────────────────────────────
+  {
+    intent: "OPEN_MAPS",
+    patterns: [
+      /\b(open\s*(google\s*)?maps?|navigate\s*on\s*maps?|launch\s*maps?|show\s*on\s*map)\b/i,
+      /\b(take\s*me\s*to|navigate\s*to)\s+[A-Z][a-z]/,
+      /\b(pin|drop\s*a\s*pin)\s*(on|at)\b/i,
+    ],
+  },
+
+  // ── Budget / expenses ─────────────────────────────────────────────────────
+  {
+    intent: "BUDGET_ANALYSIS",
+    patterns: [
+      /\b(budget|spend(ing)?|expenses?|cost(s)?|money|split|how\s*much|afford|bills?|payment|paid|saving|save\s*money|track\s*(spending|expenses?))\b/i,
+      /\bhow\s*much\s*(did|have)\s*i\b/i,
+      /\bsplit\s*(the\s*)?(bill|expenses?|cost(s)?|check)\b/i,
+      /\b(upi|payment|pay|transfer)\b/i,
+    ],
+  },
+
+  // ── Explore ───────────────────────────────────────────────────────────────
+  {
+    intent: "EXPLORE",
+    patterns: [
+      /\b(explore|discover|find\s*places?|what\s*to\s*(do|see|visit)|sightseeing|attractions?|points?\s*of\s*interest|poi|must\s*see|must\s*visit|hidden\s*gems?)\b/i,
+      /\bthings?\s*to\s*do\b/i,
+      /\b(popular|famous|top|best)\s*(places?|spots?|sites?|attractions?)\b/i,
+      /\b(restaurants?|food|eat|dining|street\s*food)\s*(in|near|at)\b/i,
+    ],
+  },
+
+  // ── Guide ─────────────────────────────────────────────────────────────────
+  {
+    intent: "GUIDE",
+    patterns: [
+      /\b(travel\s*guide|destination\s*guide|tips?\s*for|advice\s*(for|about)|tell\s*me\s*about|info\s*(on|about)|facts\s*about)\b.*(city|place|destination|country|state|region)?/i,
+      /\bguide\s*(for|to|on)\b/i,
+      /\b(about|regarding)\s+[A-Z][a-z]+.*(travel|visit|trip|tourism)/i,
+      /\b(culture|history|language|currency|customs?)\s*(of|in)\b/i,
+    ],
+  },
+
+  // ── Cancel trip ───────────────────────────────────────────────────────────
+  {
+    intent: "CANCEL_TRIP",
+    patterns: [
+      /\b(cancel|delete|remove|discard|abort)\b.*(trip|travel|plan|itinerary|booking)\b/i,
+      /\b(i\s*(don'?t\s*want|won'?t)\s*(to\s*go|travel))\b/i,
+    ],
+  },
+
+  // ── Share trip ────────────────────────────────────────────────────────────
+  {
+    intent: "SHARE_TRIP",
+    patterns: [
+      /\b(share|invite|send|add)\b.*(trip|friend|companion|travel\s*buddy|colleague|family)\b/i,
+      /\b(collaborate|group\s*trip|travel\s*with\s*(friends?|family|group))\b/i,
+    ],
+  },
+
+  // ── Currency ──────────────────────────────────────────────────────────────
+  {
+    intent: "CURRENCY",
+    patterns: [
+      /\b(exchange\s*rate|currency|convert|how\s*much\s*is\s*[$€£¥₹]|rupees?\s*to|dollars?\s*to|euros?\s*to)\b/i,
+      /\b(forex|foreign\s*exchange|money\s*exchange)\b/i,
+    ],
+  },
+
+  // ── Packing ───────────────────────────────────────────────────────────────
+  {
+    intent: "PACKING",
+    patterns: [
+      /\b(pack(ing)?|what\s*to\s*(pack|bring|carry|take)|luggage|suitcase|bag(gage)?|essentials?\s*for)\b/i,
+      /\bpacking\s*(list|tips?|guide|checklist)\b/i,
+    ],
+  },
+
+  // ── Visa ──────────────────────────────────────────────────────────────────
+  {
+    intent: "VISA",
+    patterns: [
+      /\b(visa|passport|travel\s*documents?|entry\s*requirements?|e-?visa|visa\s*on\s*arrival)\b/i,
+      /\b(do\s*i\s*need\s*a\s*visa|visa\s*(for|to|required))\b/i,
+    ],
+  },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Intent classifier — runs BEFORE hitting the LLM (zero latency / zero cost)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function classifyIntent(text: string): Intent {
+  const normalized = text.toLowerCase().trim();
+  for (const { intent, patterns } of INTENT_PATTERNS) {
+    if (patterns.some((p) => p.test(normalized))) {
+      return intent;
+    }
+  }
+  return "GENERAL_CHAT";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Destination extractor — handles natural Indian + global phrasing
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function extractDestination(text: string): string | null {
+  // Try specific lead phrases first (highest precision)
+  const leadPatterns = [
+    /\b(?:trip\s*to|travel\s*to|visit(?:ing)?|going\s*to|plan(?:ning)?\s*(?:a\s*trip\s*)?to|fly(?:ing)?\s*to|flight\s*to|vacation\s*in|holiday\s*in|going\s*to|headed\s*(?:to|for)|bound\s*for|explore)\s+([A-Z][a-zA-Z\s]{1,30}?)(?=\s*(?:for|in|on|this|next|from|with|and|,|\.|\?|!|$))/,
+    /\b(?:to|in|at|for|near|around)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\b/,
+    /\b(?:from)\s+[A-Z][a-zA-Z]+\s+(?:to)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\b/,
+  ];
+
+  for (const p of leadPatterns) {
+    const m = text.match(p);
+    const candidate = m?.[1]?.trim();
+    if (candidate && candidate.length > 1 && candidate.length < 40) {
+      // Exclude common false positives
+      const skip =
+        /^(me|you|us|the|a|an|my|your|this|that|there|here|now|india|home)$/i;
+      if (!skip.test(candidate)) return candidate;
+    }
+  }
+
+  // Fallback: find a capitalised proper noun after common travel keywords
+  const fallback = text.match(
+    /(?:^|\s)([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2})(?:\s|$|,|\.|!|\?)/,
+  );
+  if (fallback?.[1] && fallback[1].length > 2) return fallback[1].trim();
+
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Extract trip duration (days)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function extractDays(text: string): number {
+  const m =
+    text.match(/(\d+)\s*(?:day|days|night|nights)/i) ||
+    text.match(/(?:for|spend|stay(?:ing)?)\s+(\d+)/i) ||
+    text.match(/(\d+)\s*(?:week|wk)s?/i);
+  if (m) {
+    const val = parseInt(m[1], 10);
+    // weeks → days
+    if (/week|wk/i.test(m[0])) return val * 7;
+    return val;
+  }
+  if (/\ba\s+week\b/i.test(text)) return 7;
+  if (/\ba?\s*weekend\b/i.test(text)) return 3;
+  if (/\bfortnight\b/i.test(text)) return 14;
+  if (/\bmonth\b/i.test(text)) return 30;
+  return 3; // sensible default
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Extract budget from natural language
+// ─────────────────────────────────────────────────────────────────────────────
+
+const AMOUNT = String.raw`\d[\d,]*(?:\.\d+)?\s*(?:k|thousand|lakhs?|lacs?|crores?|cr)?`;
+
+/**
+ * A budget mentioned in a message, only when it is anchored by a currency or
+ * the word "budget" — so "5 days" or "2 people" are never read as money.
+ *
+ * Previously "50k" was read as 50, "1.5 lakh" as 1, and dollar amounts were
+ * silently converted at a hard-coded 83 ₹/$. The amount now keeps the
+ * currency it was given in.
+ */
+export function extractBudget(
+  text: string,
+): { amount: number; currency: string | null } | null {
+  const m =
+    text.match(new RegExp(String.raw`(?:₹|\brs\.?|\binr|\$|€|£|budget\s*(?:of|is|=|:)?)\s*${AMOUNT}`, "i")) ||
+    text.match(new RegExp(String.raw`${AMOUNT}\s*(?:rupees?|inr|rs\b|dollars?|usd|euros?|eur|pounds?|gbp)`, "i"));
+  if (!m) return null;
+  const { amount, currency } = parseBudgetInput(m[0]);
+  return amount ? { amount, currency } : null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Extract departure date from natural language
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function extractDate(text: string): string | null {
+  const today = new Date();
+  const lower = text.toLowerCase();
+
+  // Relative dates
+  if (/\btoday\b/.test(lower)) return formatLocalDate(today);
+  // Before "tomorrow", which would otherwise match first.
+  if (/\bday\s*after\s*tomorrow\b/.test(lower)) {
+    const d = new Date(today);
+    d.setDate(d.getDate() + 2);
+    return formatLocalDate(d);
+  }
+  if (/\btomorrow\b/.test(lower)) {
+    const d = new Date(today);
+    d.setDate(d.getDate() + 1);
+    return formatLocalDate(d);
+  }
+  if (/\bnext\s+week\b/.test(lower)) {
+    const d = new Date(today);
+    d.setDate(d.getDate() + 7);
+    return formatLocalDate(d);
+  }
+  if (/\bnext\s+month\b/.test(lower)) {
+    const d = new Date(today);
+    d.setMonth(d.getMonth() + 1);
+    return formatLocalDate(d);
+  }
+
+  // Weekday names
+  const days = [
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+  ];
+  for (let i = 0; i < days.length; i++) {
+    if (new RegExp(`\\b(next\\s+)?${days[i]}\\b`).test(lower)) {
+      const d = new Date(today);
+      const diff = (i - d.getDay() + 7) % 7 || 7;
+      d.setDate(d.getDate() + diff);
+      return formatLocalDate(d);
+    }
+  }
+
+  // Month names — "15th August", "August 15", "15 Aug 2026", "Sept 3rd, 2027".
+  // Abbreviations were never matched before, an explicit year was ignored,
+  // and a date of *today* was pushed to next year (midnight < now).
+  const MONTH = String.raw`(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)`;
+  const ORD = String.raw`(?:st|nd|rd|th)?`;
+  const YEAR = String.raw`(?:,?\s+(\d{4}))?`;
+  const dayFirst = lower.match(new RegExp(String.raw`\b(\d{1,2})${ORD}\s+(?:of\s+)?${MONTH}\b${YEAR}`));
+  const monthFirst = lower.match(new RegExp(String.raw`\b${MONTH}\s+(\d{1,2})${ORD}\b${YEAR}`));
+  const monthMatch = dayFirst
+    ? { day: dayFirst[1], month: dayFirst[2], year: dayFirst[3] }
+    : monthFirst
+      ? { day: monthFirst[2], month: monthFirst[1], year: monthFirst[3] }
+      : null;
+  if (monthMatch) {
+    const monthIndex = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+      .indexOf(monthMatch.month.slice(0, 3));
+    const day = parseInt(monthMatch.day, 10);
+    const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const d = new Date(
+      monthMatch.year ? parseInt(monthMatch.year, 10) : today.getFullYear(),
+      monthIndex,
+      day,
+    );
+    // Reject impossible dates such as 31 February instead of rolling over.
+    if (d.getMonth() === monthIndex && d.getDate() === day) {
+      if (!monthMatch.year && d < startOfToday) d.setFullYear(d.getFullYear() + 1);
+      return formatLocalDate(d);
+    }
+  }
+
+  // ISO or numeric: 2025-08-15 or 15/08/2025 or 08-15-2025
+  const iso = text.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (iso) return iso[1];
+  const dmy = text.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b/);
+  if (dmy) {
+    const y = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
+    return `${y}-${dmy[2].padStart(2, "0")}-${dmy[1].padStart(2, "0")}`;
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Extract passenger / traveller count
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function extractPassengers(text: string): number {
+  const m =
+    text.match(
+      /(\d+)\s*(?:people|persons?|adults?|passengers?|travell?ers?|pax|of\s+us)\b/i,
+    ) ||
+    text.match(/(?:for|with)\s+(\d+)\b/i) ||
+    text.match(/\b(\d+)\s*tickets?\b/i);
+  if (m) return parseInt(m[1], 10);
+  if (
+    /\bcouple\b|\btwo\s+of\s+us\b|\bme\s+and\s+(my\s+)?(wife|husband|partner|friend)\b/i.test(
+      text,
+    )
+  )
+    return 2;
+  if (/\bfamily\b|\bgroup\b/i.test(text)) return 4;
+  if (/\bsolo\b|\bjust\s+me\b|\balone\b|\bmyself\b/i.test(text)) return 1;
+  return 1;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Intent → precise action hint injected into the system prompt
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildIntentHint(intent: Intent, rawText: string): string {
+  const dest = extractDestination(rawText);
+  const days = extractDays(rawText);
+  const budget = extractBudget(rawText);
+  const date = extractDate(rawText);
+  const pax = extractPassengers(rawText);
+
+  switch (intent) {
+    case "GREETING":
+      return `[INTENT: GREETING] — Greet the user warmly as Jinny. Keep it to 1-2 sentences. No JSON action needed unless there is a clear follow-up request in the same message.`;
+
+    case "NAVIGATE": {
+      const pathMap: Record<string, string> = {
+        dashboard: "/dashboard",
+        home: "/dashboard",
+        "home page": "/dashboard",
+        itinerary: "/itinerary",
+        trips: "/itinerary",
+        "my trips": "/itinerary",
+        planner: "/itinerary",
+        explore: "/explore",
+        discover: "/explore",
+        friends: "/friends",
+        profile: "/profile",
+        account: "/profile",
+        guide: "/guide",
+        community: "/community",
+        settings: "/profile",
+      };
+      const lower = rawText.toLowerCase();
+      const matched = Object.entries(pathMap).find(([k]) => lower.includes(k));
+      const path = matched ? matched[1] : "/dashboard";
+      return `[INTENT: NAVIGATE] — User wants to go to ${path}. Emit navigate_to action immediately. No extra explanation needed.`;
+    }
+
+    case "CREATE_TRIP":
+      return `[INTENT: CREATE_TRIP] — User wants to plan a trip${dest ? ` to ${dest}` : ""}. Duration: ${days} days. Budget: ${budget ? formatMoney(budget.amount, budget.currency ?? "INR") : "not specified"}. Departure: ${date ?? "not specified"}. Passengers: ${pax}. If you emit create_trip, include start_date as ${date ?? "today's date"}, days as ${days}, and the stated budget/currency when provided. If destination is unclear, ask ONE short question and do not emit an action.`;
+
+    case "SEARCH_FLIGHTS": {
+      const parts = rawText.match(
+        /from\s+(\w[\w\s]*?)\s+to\s+(\w[\w\s]*?)(?:\s+on|\s+for|\s*$)/i,
+      );
+      const origin = parts ? cityToIATA(parts[1].trim()) : "DEL";
+      const destination = parts
+        ? cityToIATA(parts[2].trim())
+        : dest
+          ? cityToIATA(dest)
+          : "";
+      const depDate =
+        date ?? formatLocalDate(new Date(Date.now() + 7 * 86400000));
+      return `[INTENT: SEARCH_FLIGHTS] — User wants flights. Extracted: origin=${origin}, destination=${destination}, date=${depDate}, passengers=${pax}. Emit search_flights action immediately with these values. Use real IATA codes.`;
+    }
+
+    case "SEARCH_HOTELS":
+      return `[INTENT: SEARCH_HOTELS] — User wants hotels${dest ? ` in ${dest} (IATA: ${cityToIATA(dest)})` : ""}. Check-in: ${date ?? "not specified"}. Passengers: ${pax}. Emit search_hotels action immediately, with "destination" set to the city name.`;
+
+    case "CHECK_WEATHER":
+      return `[INTENT: CHECK_WEATHER] — User wants weather${dest ? ` for ${dest}` : " for their current/upcoming destination"}. Emit check_weather action immediately. Do not ask for confirmation.`;
+
+    case "CHECK_TRAFFIC":
+      return `[INTENT: CHECK_TRAFFIC] — User wants traffic conditions${dest ? ` near ${dest}` : ""}. Emit check_traffic action immediately and report whether the result is live or estimated.`;
+
+    case "GET_ROUTE":
+      return `[INTENT: GET_ROUTE] — User wants route/directions${dest ? ` to ${dest}` : ""}. Emit get_route or open_maps action. Ask for destination only if completely absent.`;
+
+    case "OPEN_MAPS":
+      return `[INTENT: OPEN_MAPS] — User wants to open maps navigation${dest ? ` to ${dest}` : ""}. Emit open_maps action immediately.`;
+
+    case "APP_CONTROL":
+      return `[INTENT: APP_CONTROL] — The user wants you to operate the app for them. Use the matching typed action if one exists (add_expense, add_activity, update_trip, delete_trip, create_invite_link, send_trip_message, set_language, …). Otherwise drive the CURRENT SCREEN with ui_click / ui_fill / ui_scroll, navigating first if the control is on another page. Just emit the action — the app itself asks the user to confirm anything destructive.`;
+
+    case "BUDGET_ANALYSIS":
+      return `[INTENT: BUDGET_ANALYSIS] — User wants budget or expense info. If they are logging something they spent, emit add_expense instead. Answer only with the figures given under "Budget" in USER CONTEXT — never estimate, round differently or invent spent/remaining amounts. Emit budget_alert with the trip_id; the app shows the computed numbers itself. If no trip exists, navigate to /itinerary.`;
+
+    case "EXPLORE":
+      return `[INTENT: EXPLORE] — User wants to discover places${dest ? ` in ${dest}` : ""}. Emit explore_search with the place as "query" — it opens Explore with results already loaded.`;
+
+    case "GUIDE":
+      return `[INTENT: GUIDE] — User wants a travel guide${dest ? ` for ${dest}` : ""}. Emit guide_search with the destination — it opens the guide and generates it.`;
+
+    case "CANCEL_TRIP":
+      return `[INTENT: CANCEL_TRIP] — User wants to cancel/delete a trip. Emit delete_trip with its trip_id; the app asks them to confirm before anything is deleted.`;
+
+    case "SHARE_TRIP":
+      return `[INTENT: SHARE_TRIP] — User wants to share a trip or invite companions. Emit create_invite_link for a shareable link, or add_friend_to_trip for an existing friend.`;
+
+    case "CURRENCY":
+      return `[INTENT: CURRENCY] — User wants currency/exchange rate info. Answer from your knowledge with approximate rates. Recommend checking a live converter for exact figures.`;
+
+    case "PACKING":
+      return `[INTENT: PACKING] — User wants packing advice${dest ? ` for ${dest}` : ""}. Give a concise packing list tailored to the destination and season. Check weather if destination is known.`;
+
+    case "VISA":
+      return `[INTENT: VISA] — User wants visa/travel document info${dest ? ` for ${dest}` : ""}. Share what you know and recommend checking the official embassy website for the latest requirements.`;
+
+    case "SOS":
+      return `[INTENT: SOS] — URGENT. Respond calmly and immediately. Indian emergency numbers: Police 100, Ambulance 108, Women's Helpline 1091, Fire 101, Disaster 1078, Child Helpline 1098. Emit navigate_to /dashboard. Do not delay with pleasantries.`;
+
+    default:
+      return `[INTENT: GENERAL_CHAT] — Answer conversationally using the user's trip context. Keep response concise. Emit actions only if the request clearly implies one.`;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main system prompt — Jinny's identity, capabilities, action schema
+// ─────────────────────────────────────────────────────────────────────────────
+
+const BASE_SYSTEM_PROMPT = `You are Jinny — the AI travel assistant embedded in Radiator Routes. You are precise, warm, and helpful.
+
+## PERSONALITY
+- Speak like a sharp, friendly AI concierge. Short punchy lines: "Right away.", "Already on it.", "Consider it done.", "I've run the numbers.", "Quite.", "Allow me."
+- Address the user by name when known. Reference their trips naturally to feel personal.
+- Be decisive. One clever/warm line max per response — never rambling.
+- If a detail is missing, ask exactly ONE short clarifying question.
+- Be candid when a data source or action is unavailable. Never claim an action ran unless its tool result confirms it.
+
+## YOU CAN OPERATE THE WHOLE APP
+The user can run everything by talking to you. Pages:
+- /dashboard — trip overview and stats
+- /itinerary — trip list; /itinerary/:tripId — day-by-day planner, Trip Money (budget, expenses), group chat, votes, PDF export, offline save, disruption and regret planners
+- /explore — places, flights, hotels and restaurants
+- /guide — AI destination guides
+- /friends — friends, requests, direct messages, trip invites and join requests
+- /community — communities, events and RSVPs
+- /profile — profile details, travel preferences, AI engine settings
+- /integrations — platform API keys and MCP setup
+Use a typed action when one fits. For anything else, look at CURRENT SCREEN and use the screen actions to click, type, select and scroll exactly as the user would — navigate first if the control lives on another page. One request may take several steps: after each step you see the updated screen and can continue.
+
+## RESPONSE FORMAT
+1. One short sentence in Jinny's voice acknowledging the request.
+2. When an available action is needed, emit its JSON action block inside \`\`\`json ... \`\`\` fences.
+3. The app executes each action once and sends its result back in a follow-up turn. Summarise those results in 2–3 crisp sentences. Never claim an action succeeded before its result confirms success.
+
+## AVAILABLE ACTIONS
+
+### Navigate to a page
+\`\`\`json
+{"action":"navigate_to","path":"/dashboard","label":"Opening Dashboard"}
+\`\`\`
+Valid paths: /dashboard, /itinerary, /itinerary/:id, /explore, /guide, /friends, /community, /profile
+
+### Create a trip
+\`\`\`json
+{"action":"create_trip","name":"Goa Getaway","destination":"Goa","country":"India","start_date":"2026-11-12","days":5,"budget":40000,"currency":"INR"}
+\`\`\`
+"start_date" is YYYY-MM-DD; use the extracted date, or today's date only when none was given. "days" is the requested duration. "budget" is the user's total for the whole group as a plain number, in "currency" (ISO code). Omit budget if the user gave none — never guess one.
+
+### Generate itinerary for existing trip
+\`\`\`json
+{"action":"generate_itinerary","trip_id":"UUID_HERE"}
+\`\`\`
+This opens the trip and starts itinerary generation. Do not say the plan is complete until the app reports the result.
+
+### Search flights (MUST use IATA codes)
+\`\`\`json
+{"action":"search_flights","origin":"DEL","destination":"GOI","departureDate":"2025-08-15","returnDate":"2025-08-20","adults":1}
+\`\`\`
+
+### Search hotels
+\`\`\`json
+{"action":"search_hotels","destination":"Goa","cityCode":"GOI","checkInDate":"2025-08-15","checkOutDate":"2025-08-18","adults":1}
+\`\`\`
+
+### Check weather
+\`\`\`json
+{"action":"check_weather","destination":"Goa","days":7}
+\`\`\`
+
+### Check traffic conditions
+\`\`\`json
+{"action":"check_traffic","destination":"Mumbai","lat":19.076,"lon":72.877}
+\`\`\`
+
+### Calculate route (ORS)
+\`\`\`json
+{"action":"get_route","originLat":28.6139,"originLon":77.209,"destLat":27.1751,"destLon":78.0421,"destName":"Taj Mahal","profile":"driving-car"}
+\`\`\`
+Profiles: driving-car | foot-walking | cycling-regular
+
+### Open Google Maps navigation
+\`\`\`json
+{"action":"open_maps","lat":27.1751,"lon":78.0421,"name":"Taj Mahal","mode":"driving"}
+\`\`\`
+
+### Budget alert
+\`\`\`json
+{"action":"budget_alert","trip_id":"UUID_HERE","suggestions":["Cook dinner in","Skip paid museum entry"]}
+\`\`\`
+Do not put amounts in budget_alert — the app calculates planned, spent and remaining from the trip's data and displays them.
+
+### Explore places
+\`\`\`json
+{"action":"explore_search","query":"Temples in Varanasi"}
+\`\`\`
+
+### Travel guide
+\`\`\`json
+{"action":"guide_search","destination":"Rajasthan"}
+\`\`\`
+
+### Assess activities vs weather
+\`\`\`json
+{"action":"assess_activities_weather","destination":"Kerala","lat":10.8505,"lon":76.2711,"activities":[{"name":"Backwater cruise","category":"attraction","date":"2025-08-15"}]}
+\`\`\`
+
+### Curated safety guidance
+\`\`\`json
+{"action":"check_safety","destination":"Mumbai"}
+\`\`\`
+This returns static general guidance matched to the destination. It is not live incident reporting or an official risk rating.
+
+### Trip data actions
+Every trip action takes "trip_id" (from USER CONTEXT) or "trip_name" ("Goa"); leave both out to use the trip open on screen or the next upcoming one.
+\`\`\`json
+{"action":"add_expense","trip_name":"Goa","title":"Dinner at Thalassa","amount":2400,"category":"food"}
+\`\`\`
+category: food | transport | activity | accommodation | shopping | general. Paid by the user, split equally across the trip's members.
+\`\`\`json
+{"action":"list_expenses","trip_name":"Goa"}
+{"action":"delete_expense","trip_name":"Goa","title":"Dinner at Thalassa"}
+{"action":"add_activity","trip_name":"Goa","name":"Sunset at Chapora Fort","day":2,"start_time":"17:30","duration_minutes":90,"location_name":"Chapora Fort, Goa","category":"attraction","cost":0}
+{"action":"remove_activity","trip_name":"Goa","name":"Chapora Fort"}
+{"action":"update_trip","trip_name":"Goa","budget":50000,"start_date":"2026-12-20","end_date":"2026-12-24","name":"Goa Christmas"}
+{"action":"delete_trip","trip_name":"Goa"}
+{"action":"create_invite_link","trip_name":"Goa"}
+{"action":"add_friend_to_trip","friend_name":"Priya","trip_name":"Goa"}
+{"action":"send_trip_message","trip_name":"Goa","text":"Landing at 6, see you at the hotel!"}
+\`\`\`
+add_activity takes "day" (1 = first trip day) or "date" (YYYY-MM-DD). Each block above is a separate action — emit one fenced block per action.
+
+### People, communities and settings
+\`\`\`json
+{"action":"send_direct_message","to":"Priya","text":"Are you free in December?"}
+{"action":"send_friend_request","name":"Rahul Mehta"}
+{"action":"respond_friend_request","name":"Rahul","accept":true}
+{"action":"join_community","name":"Backpackers India"}
+{"action":"leave_community","name":"Backpackers India"}
+{"action":"update_preferences","pace":"relaxed","likes":["food","attraction"],"dislikes":["shopping"],"budget_ceiling":30000}
+{"action":"set_language","code":"hi"}
+{"action":"sign_out"}
+\`\`\`
+pace: relaxed | moderate | packed. likes/dislikes: food, attraction, entertainment, shopping, other. set_language codes: en, hi, bn, te, mr, ta, gu, kn, ml, pa, ur, or, fr, es, de, pt, ar, ja, zh, ko, ru, it.
+
+### Screen actions — operate whatever is on screen
+\`\`\`json
+{"action":"ui_click","target":"j12"}
+{"action":"ui_fill","target":"j4","value":"Jaipur","submit":true}
+{"action":"ui_scroll","direction":"down"}
+{"action":"go_back"}
+\`\`\`
+"target" is an id from CURRENT SCREEN. ui_fill sets text inputs, dates (YYYY-MM-DD), selects (option label) and checkboxes ("true"/"false"); "submit": true presses Enter afterwards. Ids change every turn — only use ids from the latest CURRENT SCREEN. Never invent an id. Never try to fill a password.
+
+### Confirmation
+Deleting, sending, inviting, signing out, payments and SOS are confirmed by the app. When a result says CONFIRMATION NEEDED, ask the user that exact question in one short sentence and stop — don't emit any action. Their "yes" or "no" is handled by the app.
+
+## STRICT RULES
+1. Use REAL IATA codes — never guess. DEL=Delhi, BOM=Mumbai, BLR=Bangalore, MAA=Chennai, CCU=Kolkata, HYD=Hyderabad, GOI=Goa, PNQ=Pune, AMD=Ahmedabad, JAI=Jaipur, COK=Kochi, LKO=Lucknow, VNS=Varanasi, ATQ=Amritsar, SXR=Srinagar, IXL=Leh, UDR=Udaipur, SIN=Singapore, DXB=Dubai, LHR=London, CDG=Paris, JFK=New York, NRT=Tokyo, SYD=Sydney.
+2. Never fabricate flight prices, hotel rates, or weather data — always emit the action to fetch live data.
+3. Emit actions FIRST, then explain when results return.
+4. If an [INTENT: X] hint is present, follow it precisely.
+5. For SOS: respond calmly — Police 100, Ambulance 108, Women 1091, Fire 101.
+6. When weather is requested or needed to assess a requested outdoor activity, fetch forecast data and state its date range.
+7. Traffic results may be estimated; report the source and never describe a time-of-day estimate as live traffic.
+8. Never say you did something in the app unless a tool result confirms it. If a step failed, say what happened and offer the next best step.
+9. Never repeat an action that already succeeded in this request.
+
+## EXAMPLES
+
+User: "Hey Jinny"
+Jinny: "At your service. What shall we tackle today? 🧡"
+
+User: "Plan a 5-day trip to Goa for ₹40,000"
+Jinny: "Goa for 5 days — excellent choice. Let me check conditions and set it up."
+\`\`\`json
+{"action":"check_weather","destination":"Goa","days":7}
+\`\`\`
+\`\`\`json
+{"action":"create_trip","name":"Goa Getaway","destination":"Goa","country":"India","days":5,"budget":40000}
+\`\`\`
+
+User: "Flights from Delhi to Mumbai on 15th August"
+Jinny: "Scanning that route now. ✈️"
+\`\`\`json
+{"action":"search_flights","origin":"DEL","destination":"BOM","departureDate":"2025-08-15","adults":1}
+\`\`\`
+
+User: "Open explore"
+Jinny: "Right away."
+\`\`\`json
+{"action":"navigate_to","path":"/explore","label":"Opening Explore"}
+\`\`\`
+
+User: "Navigate to Taj Mahal"
+Jinny: "Plotting the route — I'd leave before 9 AM to beat the crowds."
+\`\`\`json
+{"action":"open_maps","lat":27.1751,"lon":78.0421,"name":"Taj Mahal","mode":"driving"}
+\`\`\`
+
+User: "How's the weather in Shimla?"
+Jinny: "Fetching the latest for Shimla."
+\`\`\`json
+{"action":"check_weather","destination":"Shimla","days":7}
+\`\`\`
+
+User: "I need help, I'm lost"
+Jinny: "Stay calm. I'm here. Emergency numbers: Police 100 · Ambulance 108 · Women's Helpline 1091. Share your location with someone you trust."
+\`\`\`json
+{"action":"navigate_to","path":"/dashboard","label":"Opening Dashboard for safety"}
+\`\`\`
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Load user + trip context from Supabase
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The context below costs several database round trips. On a voice call that
+// is dead air before every single reply, so it is reused for a short window
+// and dropped whenever an action may have changed it (invalidatePersonalContext).
+const PERSONAL_CONTEXT_TTL_MS = 45_000;
+let personalContextCache: { userId: string; at: number; value: Promise<string> } | null = null;
+
+/** Forget the cached user context, e.g. after a trip was created or changed. */
+export function invalidatePersonalContext(): void {
+  personalContextCache = null;
+}
+
+async function loadPersonalContext(): Promise<string> {
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  const userId = session?.user?.id;
+  if (!userId) return "";
+  const cached = personalContextCache;
+  if (cached && cached.userId === userId && Date.now() - cached.at < PERSONAL_CONTEXT_TTL_MS) {
+    return cached.value;
+  }
+  const value = fetchPersonalContext();
+  personalContextCache = { userId, at: Date.now(), value };
+  return value;
+}
+
+async function fetchPersonalContext(): Promise<string> {
+  try {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (!session?.user) return "";
+
+    const [{ data: profile }, { data: trips }] = await Promise.all([
+      supabase.from("profiles").select("*").eq("id", session.user.id).single(),
+      supabase
+        .from("trips")
+        .select("*")
+        .order("start_date", { ascending: false })
+        .limit(8),
+    ]);
+
+    let ctx = "\n\n## USER CONTEXT\n";
+
+    if (profile) {
+      const p = profile as Record<string, unknown>;
+      ctx += `User: ${p.name ?? "Traveller"} (ID: ${session.user.id})\n`;
+      const prefs = (p.preferences as Record<string, unknown>) ?? {};
+      if (Object.keys(prefs).length > 0)
+        ctx += `Preferences: ${JSON.stringify(prefs)}\n`;
+      const personality =
+        (p.travel_personality as Record<string, unknown>) ?? {};
+      if (Object.keys(personality).length > 0)
+        ctx += `Travel personality: ${JSON.stringify(personality)}\n`;
+      const history = (p.travel_history as unknown[]) ?? [];
+      if (history.length > 0)
+        ctx += `Past destinations: ${history
+          .map((h) =>
+            typeof h === "object" && h !== null
+              ? ((h as Record<string, string>).destination ?? JSON.stringify(h))
+              : String(h),
+          )
+          .join(", ")}\n`;
+    }
+
+    if (trips && trips.length > 0) {
+      // Computed by lib/budget.ts — the same figures the Trip Money panel shows.
+      const budgets = await loadTripBudgets(trips).catch(() => new Map());
+      ctx += `\nTrips (${trips.length}):\n`;
+      for (const trip of trips) {
+        const t = trip as Record<string, unknown>;
+        const b = budgets.get(t.id as string);
+        const money = (n: number) => formatMoney(n, t.currency as string);
+        const budgetLine = b
+          ? b.summary.budget > 0
+            ? `Budget: ${money(b.summary.budget)} | Planned (itinerary): ${money(b.summary.planned)} | Spent (logged expenses): ${money(b.summary.spent)} | Remaining: ${money(b.summary.remaining)} | ${b.summary.percentSpent}% spent`
+            : `Budget: not set | Planned: ${money(b.summary.planned)} | Spent: ${money(b.summary.spent)}`
+          : `Budget: ${money(Number(t.budget_total ?? 0))} (spending unavailable)`;
+        ctx += `- "${t.name}" | ${t.destination}, ${t.country ?? ""} | ${t.start_date} → ${t.end_date} | ${budgetLine} | Status: ${t.status} | ID: ${t.id}\n`;
+      }
+
+      // Latest trip activities (up to 15)
+      const latest = trips[0] as Record<string, unknown>;
+      if (latest?.id) {
+        const { data: itin } = await supabase
+          .from("itineraries")
+          .select("id")
+          .eq("trip_id", latest.id as string)
+          .order("version", { ascending: false })
+          .limit(1);
+
+        if (itin && itin.length > 0) {
+          const { data: acts } = await supabase
+            .from("activities")
+            .select("name, category, start_time, cost, location_name")
+            .eq("itinerary_id", itin[0].id)
+            .order("start_time", { ascending: true })
+            .limit(15);
+
+          if (acts && acts.length > 0) {
+            ctx += `\nLatest itinerary for "${latest.name}" (${acts.length} activities):\n`;
+            for (const a of acts) {
+              const act = a as Record<string, unknown>;
+              const time = act.start_time
+                ? new Date(act.start_time as string).toLocaleDateString(
+                    "en-IN",
+                    {
+                      weekday: "short",
+                      month: "short",
+                      day: "numeric",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    },
+                  )
+                : "TBD";
+              ctx += `  ${time}: ${act.name} [${act.category ?? "activity"}]${act.location_name ? ` @ ${act.location_name}` : ""}${act.cost ? ` ${formatMoney(Number(act.cost), latest.currency as string)}` : ""}\n`;
+            }
+          }
+        }
+      }
+
+      ctx += `Total budget across all trips: ${formatMoneyTotals(
+        (trips as Record<string, unknown>[]).map((t) => ({
+          amount: Number(t.budget_total ?? 0),
+          currency: t.currency as string,
+        })),
+      )}\n`;
+    }
+
+    return ctx;
+  } catch {
+    return "";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Robust JSON extractor — handles various LLM output formats
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function extractAllJsonBlocks(text: string): unknown[] {
+  const results: unknown[] = [];
+
+  // Strategy 1: standard ```json ... ``` fences
+  const fenceRegex = /```(?:json)?\s*([\s\S]*?)```/gi;
+  let match: RegExpExecArray | null;
+  while ((match = fenceRegex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      if (parsed && typeof parsed === "object") results.push(parsed);
+    } catch {
+      try {
+        const repaired = match[1]
+          .trim()
+          .replace(/,\s*}/g, "}")
+          .replace(/,\s*]/g, "]")
+          .replace(/(['"])?([a-zA-Z_][a-zA-Z0-9_]*)(['"])?\s*:/g, '"$2":')
+          .replace(/:\s*'([^']*)'/g, ': "$1"');
+        const parsed2 = JSON.parse(repaired);
+        if (parsed2 && typeof parsed2 === "object") results.push(parsed2);
+      } catch {
+        /* skip */
+      }
+    }
+  }
+
+  if (results.length > 0) return results;
+
+  // Strategy 2: bare JSON objects { ... } not in code fences
+  const objectRegex = /\{[^{}]*(?:\{[^{}]*\}[^{}]*)?\}/g;
+  while ((match = objectRegex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[0]);
+      if ((parsed as any)?.action) results.push(parsed);
+    } catch {
+      /* skip */
+    }
+  }
+
+  return results;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAI-compatible message type
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface OAIMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+function buildMessages(
+  systemPrompt: string,
+  messages: Array<{ role: "user" | "assistant"; content: string }>,
+): OAIMessage[] {
+  return [
+    { role: "system", content: systemPrompt },
+    ...messages.map((m) => ({
+      role: m.role as "user" | "assistant",
+      content: m.content,
+    })),
+  ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core fetch helper — shared by streaming + non-streaming
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * True when either backend can serve a chat turn: Supabase can reach the hosted
+ * proxy, or on-device WebLLM is selected on a WebGPU-capable browser.
+ */
+export function isChatAvailable(): boolean {
+  if (getAIProvider() === "webllm" && hasWebGPUAPI()) return true;
+  return isSupabaseConfigured;
+}
+
+/**
+ * Whether this turn should run on-device rather than against Groq.
+ *
+ * Not named `use*` — that prefix makes ESLint's react-hooks plugin treat it as
+ * a hook and reject the call from these plain async functions.
+ */
+function shouldRunOnDevice(): boolean {
+  return getAIProvider() === "webllm" && hasWebGPUAPI();
+}
+
+async function groqFetch(
+  messages: OAIMessage[],
+  stream: boolean,
+  temperature = 0.3,
+  maxTokens = 3072,
+): Promise<Response> {
+  if (!isChatAvailable()) throw new Error("NO_API_KEY");
+
+  const res = await groqProxyFetch("chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages,
+      temperature,
+      max_tokens: groqMaxTokens(maxTokens),
+      stream,
+      stop: null,
+      ...groqModelParams(),
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(groqErrorCode(res.status, await res.text().catch(() => "")));
+  }
+
+  return res;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Build the full system prompt with intent hint + user context
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Appended when the user is talking to Jinny out loud. Chat replies are written
+// to be read — markdown, lists, several options — and read aloud they sound
+// like a recorded announcement. This asks for what a person says on a call.
+const VOICE_CALL_PROMPT = `## VOICE CALL MODE — this overrides the response format above
+You are on a live voice call with the user. Everything you write outside JSON action blocks is spoken aloud by text-to-speech, straight away.
+- Talk like a friendly, switched-on person on the phone: warm, relaxed, natural contractions ("I'll", "you're", "that's"). A quick natural reaction is good ("Ooh, Goa in December, nice.", "Got it.", "Sure, one sec.").
+- Keep each reply to one to three short sentences, about 40 words at most. Give the single most useful thing and offer more ("Want the rest of the week too?") rather than listing everything.
+- Never use markdown, bullet points, headings, tables, emoji, links, IDs or code in spoken text. Write numbers the way people say them: "about forty thousand rupees", "around two hours", "the 15th of August".
+- Ask at most one short question, and only when you need the answer or it moves the plan forward.
+- Before an action, say one short natural line ("Let me check the forecast."), then emit the JSON action block. Action blocks are never spoken.
+- When summarising tool results, say the one or two things that matter and offer details if they want them.
+- If you didn't understand, say so briefly and ask them to repeat, like a person would.`;
+
+async function buildSystemPrompt(
+  lastUserMessage: string,
+  userLang = "en",
+  intentOverride?: Intent,
+  voice = false,
+  screen?: string,
+): Promise<string> {
+  const personalCtx = await loadPersonalContext();
+  const intent = intentOverride ?? classifyIntent(lastUserMessage);
+  const intentHint = buildIntentHint(intent, lastUserMessage);
+
+  // Inject language instruction so Jinny replies in the user's chosen language
+  const langNote =
+    userLang && userLang !== "en"
+      ? `\n\n## LANGUAGE INSTRUCTION\nThe user's interface language is set to "${userLang}". You MUST respond entirely in that language (use its native script where applicable). Keep all JSON action blocks in English — only translate your conversational text.`
+      : "";
+
+  const voiceNote = voice ? `\n\n${VOICE_CALL_PROMPT}` : "";
+  // On-device models have a 4k context; keep the screen to its top part there.
+  const screenText = screen && shouldRunOnDevice() ? screen.slice(0, 1500) : screen;
+  const screenNote = screenText
+    ? `\n\n## CURRENT SCREEN\nWhat the user sees right now. Element ids are valid for this turn only.\n${screenText}`
+    : "";
+  return `${BASE_SYSTEM_PROMPT}${langNote}\n\n## DETECTED INTENT\n${intentHint}${personalCtx}${screenNote}${voiceNote}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Non-streaming chat
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function sendChatMessage(
+  messages: Array<{ role: "user" | "assistant"; content: string }>,
+  userLang = "en",
+): Promise<string> {
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  const systemPrompt = await buildSystemPrompt(
+    lastUser?.content ?? "",
+    userLang,
+  );
+
+  if (shouldRunOnDevice()) {
+    const { webllmChat } = await import("./webllm");
+    return webllmChat(
+      systemPrompt,
+      messages.map((m) => ({
+        role: m.role === "assistant" ? ("model" as const) : ("user" as const),
+        content: m.content,
+      })),
+      0.3,
+      1024,
+    );
+  }
+
+  const res = await groqFetch(buildMessages(systemPrompt, messages), false);
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content ?? "";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Streaming chat — calls onChunk for each delta
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function streamChatMessage(
+  messages: Array<{ role: "user" | "assistant"; content: string }>,
+  onChunk: (chunk: string) => void,
+  userLang = "en",
+  intentOverride?: Intent,
+  options: { voice?: boolean; screen?: string } = {},
+): Promise<string> {
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  const systemPrompt = await buildSystemPrompt(
+    lastUser?.content ?? "",
+    userLang,
+    intentOverride,
+    options.voice,
+    options.screen,
+  );
+  // A little more variety on calls, so Jinny doesn't open every turn the same way.
+  const temperature = options.voice ? 0.6 : 0.3;
+
+  if (shouldRunOnDevice()) {
+    const { webllmStream } = await import("./webllm");
+    return webllmStream(
+      systemPrompt,
+      messages.map((m) => ({
+        role: m.role === "assistant" ? ("model" as const) : ("user" as const),
+        content: m.content,
+      })),
+      onChunk,
+      temperature,
+      1024,
+    );
+  }
+
+  const res = await groqFetch(buildMessages(systemPrompt, messages), true, temperature);
+
+  if (!res.body) {
+    const text = await sendChatMessage(messages, userLang);
+    onChunk(text);
+    return text;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+
+  const processLine = (line: string) => {
+    if (!line.startsWith("data: ")) return;
+    const jsonStr = line.slice(6).trim();
+    if (!jsonStr || jsonStr === "[DONE]") return;
+    try {
+      const parsed = JSON.parse(jsonStr);
+      const chunk: string = parsed.choices?.[0]?.delta?.content ?? "";
+      if (chunk) {
+        fullText += chunk;
+        onChunk(chunk);
+      }
+    } catch {
+      /* malformed chunk — skip */
+    }
+  };
+
+  outer: while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    let newlineIdx: number;
+    while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
+      let line = buffer.slice(0, newlineIdx);
+      buffer = buffer.slice(newlineIdx + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      if (line.trim() === "data: [DONE]") break outer;
+      processLine(line);
+    }
+  }
+
+  if (buffer.trim()) processLine(buffer.trim());
+
+  return fullText;
+}

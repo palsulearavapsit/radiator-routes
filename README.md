@@ -1,0 +1,1140 @@
+# 🗺️ Atlas AI
+
+> **Voice-first, constraint-checked AI travel planner for group trips, with optional local inference and offline trip access.**
+
+> **Research and patent note:** This repository contains a structured research-paper
+> manuscript and a patent-preparation technical disclosure. They distinguish implemented
+> mechanisms from unmeasured hypotheses and are not legal advice. Start at
+> [`docs/README.md`](./docs/README.md).
+
+[![React](https://img.shields.io/badge/React-18.3-61DAFB?logo=react)](https://react.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript)](https://www.typescriptlang.org)
+[![Vite](https://img.shields.io/badge/Vite-8.2-646CFF?logo=vite)](https://vite.dev)
+[![Supabase](https://img.shields.io/badge/Supabase-Realtime-3ECF8E?logo=supabase)](https://supabase.com)
+[![Tailwind CSS](https://img.shields.io/badge/Tailwind-3.4-06B6D4?logo=tailwindcss)](https://tailwindcss.com)
+[![PWA](https://img.shields.io/badge/PWA-Offline--Capable-5A0FC8)](https://web.dev/progressive-web-apps/)
+[![Vulnerabilities](https://img.shields.io/badge/npm%20audit-0%20vulnerabilities-brightgreen)](#-security)
+
+---
+
+## 📖 Table of Contents
+
+1. [System Mindmap](#-system-mindmap)
+2. [Overview](#-overview)
+3. [Key Features](#-key-features)
+4. [AI Engines: hosted or on-device](#-ai-engines-hosted-or-on-device)
+5. [Offline & PWA Behaviour](#-offline--pwa-behaviour)
+6. [Tech Stack](#-tech-stack)
+7. [Architecture](#-architecture)
+8. [Getting Started](#-getting-started)
+9. [Environment Variables](#-environment-variables)
+10. [Project Structure](#-project-structure)
+11. [Pages & Routing](#-pages--routing)
+12. [Services Reference](#-services-reference)
+13. [Database Schema](#-database-schema)
+14. [Supabase Setup](#-supabase-setup)
+15. [Available Scripts](#-available-scripts)
+16. [Build & Bundle Budget](#-build--bundle-budget)
+17. [Security](#-security)
+18. [Roadmap](#-roadmap)
+19. [Research & Prior Art](#-research--prior-art)
+20. [Deployment](#-deployment)
+21. [Contributing](#-contributing)
+22. [Documentation](#-documentation)
+23. [License](#-license)
+
+---
+
+## 🗺️ System Mindmap
+
+```mermaid
+mindmap
+  root((Radiator<br/>Routes))
+    AI Layer
+      Dual backend dispatch
+        Groq GPT-OSS 120B hosted; Qwen vision
+        WebLLM on-device WebGPU
+        Capability-gated fallback
+      Jinny assistant
+        Streaming chat
+        Intent classification
+      Planning
+        Itinerary generation
+        Dynamic replanning
+        Travel memory
+      Determinism guards
+        Grammar-constrained JSON
+        Semantic verifier
+        Least Misery scoring
+    Offline Layer
+      Service worker
+        App shell precache
+        11 runtime caches
+        Navigate fallback
+      Trip persistence
+        IndexedDB offline trips
+        Map tiles z10 to z14
+      On-device model cache
+        Weights cached once
+        Zero egress inference
+    Data Sources
+      Free no key
+        Open-Meteo weather
+        OpenStreetMap tiles
+        Wikipedia Wikimedia
+        Web Speech API
+        MyMemory translate
+      Free tier optional key
+        Groq inference
+        OpenRouteService routing + geocoding
+        OpenTripMap
+      Backend
+        Supabase Postgres
+        Row Level Security
+        Realtime channels
+    Feature Modules
+      Trips and itinerary
+      Group trade-off planner
+      Explore and discovery
+      Friends and community
+      Expenses and UPI
+      SOS and safety
+      Accessibility panel
+    Quality Gates
+      TypeScript strictish
+      ESLint flat config
+      Vitest 228 tests
+      npm audit zero vulns
+      First load ~540 kB
+```
+
+---
+
+## 🌟 Overview
+
+**Atlas AI** is an AI-powered group travel planner for India. Every integration is either
+completely free (no key) or free-tier with no credit card — there are no paid APIs anywhere in
+the stack.
+
+- **Voice-first interaction** — speak your trip, no forms
+- **Regret-aware planning** — generates plan variants and picks the one with the lowest maximum regret across the group
+- **Real-time collaboration** — Supabase Realtime for chat, votes, DMs and expense updates
+- **Offline-capable PWA** — saved trips and pre-cached maps work with no connection
+- **₹ INR native** — budgets, expense splits and UPI payments in Indian Rupees
+
+> **Only Supabase is required to run the app.** Every other integration degrades gracefully when
+> its key is absent.
+
+---
+
+## ✨ Key Features
+
+### 🤖 AI core — hosted Groq **or** on-device WebLLM
+| Feature | Description |
+|---|---|
+| **Voice-first planning** | Web Speech API transcribes in-browser; the LLM extracts destination, dates, budget, group size and interests |
+| **Jinny assistant** | Streaming chat with intent classification (`services/aiChat.ts`) |
+| **Group trade-off planner** | Three plan variants, each verified for feasibility then scored by **computed** Least Misery over every traveller's stated preferences (`lib/groupRegret.ts`, `components/RegretPlanner.tsx`) |
+| **Plan verification** | 14 deterministic client-side checks — including budget, trip dates, cost sums, timing overlap, travel feasibility, opening hours, coordinate sanity and pace — that run offline and catch what JSON-schema validity cannot (`lib/itineraryVerifier.ts`) |
+| **Automatic plan repair** | A failed plan is not just flagged. Violations are fed back to the model as a targeted repair instruction and the plan is regenerated once (`lib/planRepair.ts`) |
+| **Preference elicitation** | Members state category weights, pace and a personal budget cap; this is the input the fairness score is computed from (`components/TravelPreferencesForm.tsx`, `lib/travelPreferences.ts`) |
+| **AI reasoning transparency** | "Why This Plan" panel exposes selection criteria, budget logic and local tips |
+| **Forecast-aware replanning** | User-requested Open-Meteo checks flag severe forecast conditions on scheduled dates; a feasibility-checked AI replan is previewed for approval (`services/dynamicReplan.ts`) |
+| **Travel memory** | Learns preferences across trips and folds them into future plans |
+| **Platform API** | Scoped, revocable API keys, versioned REST/OpenAPI endpoints, and an MCP server for connected AI clients (`/integrations`) |
+
+Hosted AI requests go through an authenticated Supabase proxy; provider secrets stay server-side.
+When the deployment has no Groq secret and the user has not selected an on-device model, AI surfaces
+show an "AI unavailable" notice while the rest of the app remains usable.
+
+See [AI Engines](#-ai-engines-hosted-or-on-device) for choosing a backend.
+
+### 🗓️ Itinerary & planning
+Day-by-day timeline with categorised activities · collaborative voting · A4 PDF export via
+jsPDF + autoTable (dynamically imported, so it costs nothing until you click Export) ·
+disruption replanner · group trade-off planner with per-traveller explanations.
+
+> **How the fairness score works.** For each candidate plan, every member's utility is computed from
+> their stated category weights, review scores and personal budget cap. A member's *regret* is the gap
+> between the best plan available to them and the one selected. The group score is the **worst**
+> member's regret — Least Misery, per
+> [Masthoff](https://link.springer.com/chapter/10.1007/1-4020-2164-X_5) — and the recommended plan
+> minimises it. All arithmetic, no model involvement, runs offline, and each member sees their own
+> trade-off. An earlier version of this feature had the model emit a score that the prompt had
+> already specified; that is documented in [`docs/RESEARCH.md`](./docs/RESEARCH.md) §3.2 and has been
+> removed.
+>
+> Preferences are stated in **Profile → Travel preferences**
+> (`components/TravelPreferencesForm.tsx`). Without them there is nothing to score, so the planner
+> says the plan was not scored rather than inventing a number.
+
+### 🌍 Maps & navigation
+2D Leaflet + OpenStreetMap · 3D MapLibre GL globe · 360° street view · AR attraction viewer ·
+OpenRouteService directions, geocoding, and elevation through authenticated Edge proxies · navigation deep-links.
+Heavy map and AR bundles are lazy-loaded behind `Suspense`.
+
+### ⛅ Live data
+7-day Open-Meteo forecast (temp, rain, UV, wind, sunrise/sunset) · severe weather warnings fed
+into planning · time-of-day traffic estimation · Wikipedia/Wikimedia place context and imagery.
+
+### 👥 Social & collaboration
+Friend requests · real-time DMs · trip invite codes · organiser-approved join requests ·
+per-trip group chat · community groups with events and RSVPs.
+
+### 💰 Finance
+Group expense splitting (equal / custom / percentage) · per-member settlement tracking ·
+UPI P2P deep-link payments · country-aware currency formatting.
+
+### 🛡️ Safety & accessibility
+SOS panel with local emergency numbers and live GPS sharing · destination advisories from
+Wikipedia REST plus curated regional guidance · 5-tab accessibility panel (Speak, Listen,
+Camera, Ask AI, Settings) · high-contrast and large-text modes.
+
+---
+
+## 🧠 AI Engines: hosted or on-device
+
+Every AI surface runs against one of two interchangeable backends. The choice lives in
+**Profile → AI engine** and persists per browser.
+
+| | **Groq** (default) | **WebLLM** (on-device) |
+|---|---|---|
+| Model | Server configured (default: GPT-OSS 120B) | LLaMA 3.2 1B/3B, Qwen 2.5 1.5B/3B, Phi 3.5 Mini, LLaMA 3.1 8B |
+| API key | Server-side Supabase secret | **None** |
+| Network | Required per request | One-time model download only |
+| Privacy | Prompts sent to Groq | **Prompts never leave the device** |
+| Works offline | No | **Yes, once cached** |
+| Speed | Fast | Slower; depends on your GPU |
+| Quality | Hosted model configured by the deployment | Lower; depends on the selected local model |
+| Cost of entry | Free-tier signup | 0.7–4.3 GB download, WebGPU browser |
+
+### Requirements for on-device
+
+- **WebGPU**: Chrome/Edge 113+, Chrome for Android 121+, Safari 26+
+- **GPU memory**: roughly matching the model — 0.9 GB (1B) up to 5 GB (8B)
+- Hardware acceleration enabled and a driver that isn't blocklisted
+
+The app probes `navigator.gpu` *and* requests an adapter before offering the option, because a
+browser can expose the API and still refuse an adapter. If the probe fails, the reason is shown
+and the option is disabled.
+
+### Models
+
+All ids are verified against `prebuiltAppConfig.model_list` in `@mlc-ai/web-llm` 0.2.84, q4f16_1
+quantised, 4096-token context.
+
+| Model | Download | GPU memory | Notes |
+|---|---|---|---|
+| Llama 3.2 1B | ~0.7 GB | 0.9 GB | Fastest; weak at long itinerary JSON |
+| Qwen 2.5 1.5B | ~1.2 GB | 1.6 GB | Good multilingual coverage for its size |
+| **Llama 3.2 3B** | ~1.8 GB | 2.2 GB | **Recommended default** |
+| Qwen 2.5 3B | ~2.0 GB | 2.4 GB | Strongest multilingual at a manageable size |
+| Phi 3.5 Mini | ~2.6 GB | 3.6 GB | Strong reasoning; needs a discrete GPU |
+| Llama 3.1 8B | ~4.3 GB | 4.9 GB | Highest on-device quality; ~6 GB free VRAM |
+
+### How it's wired
+
+`services/gemini.ts` is the single dispatch point. `callGemini`, `callGeminiChat` and
+`streamGemini` keep identical signatures and route to either backend, so `aiPlanner`,
+`dynamicReplan`, `travelMemory` and `AccessibilityPanel` needed no changes. `services/aiChat.ts`
+does the same for streaming Jinny turns.
+
+Three deliberate constraints:
+
+- **`@mlc-ai/web-llm` is dynamically imported.** It is ~5.9 MB, and the worker bundles its own
+  copy. Neither is in the initial bundle, and both are excluded from the service-worker precache
+  via `globIgnores` — otherwise every visitor would pay 11.7 MB on first load. A runtime
+  `CacheFirst` rule caches them after first use so on-device AI still works offline.
+- **Inference runs in a Web Worker** (`services/webllmWorker.ts`) so token generation doesn't
+  block the UI. Falls back to the main thread if worker construction fails.
+- **Nothing downloads without an explicit click.** Multi-gigabyte weights on a metered connection
+  are not an accident to risk.
+
+If a stale `webllm` preference reaches a browser with no WebGPU, calls fall back to Groq rather
+than failing.
+
+### Trade-offs worth knowing
+
+On-device models are 10–70× smaller than LLaMA 70B. Expect shorter, less nuanced itineraries and
+occasional malformed JSON on the 1B models — `jsonMode` constrains decoding via grammar, which
+helps, but does not fully close the gap. The 3B tier is the practical floor for itinerary
+generation; 1B is fine for chat. `max_tokens` is capped at 2048 on-device to fit the 4096-token
+context.
+
+---
+
+## 📴 Offline & PWA Behaviour
+
+Installable on Android, iOS and desktop. The service worker is generated by
+`vite-plugin-pwa` in **`generateSW`** mode with `registerType: "autoUpdate"`.
+
+### What works with no connection
+
+| Capability | Mechanism |
+|---|---|
+| **Any route loads** | App shell precached (91 entries, ~4.7 MB) + `navigateFallback: index.html` |
+| **Saved trips** | Trip, itineraries and activities in IndexedDB (`services/offlineTrip.ts`) |
+| **Editing saved activities** | Writes queue durably and replay FIFO on reconnect (`lib/offlineMutation.ts`, `hooks/useOfflineSync.ts`); pending count shown in the banner |
+| **Maps around a saved trip** | ~173 OSM tiles pre-fetched at z10–z14 into the `osm-tiles-offline` cache |
+| **Previously-viewed Supabase data** | `StaleWhileRevalidate` on `/rest/*` replays the last response |
+| **Weather, places, Wikipedia, fonts** | Per-origin runtime caches with TTLs (see below) |
+| **App updates** | Waiting worker detected; `OfflineIndicator` offers a one-tap reload |
+
+### What still needs a connection
+
+| Not available offline | Why |
+|---|---|
+| **Sign-in / sign-up** | Auth endpoints are deliberately never cached |
+| **AI on the Groq backend** | Hosted inference is a live API call. **Switch to on-device AI and this works offline** — see [AI Engines](#-ai-engines-hosted-or-on-device) |
+| **Realtime chat, votes, DMs** | WebSocket transport can't be replayed from cache |
+| **New route calculation** | OpenRouteService is not runtime-cached |
+| **Most writes** | Activity status changes and activity edits **do** queue and replay (`lib/offlineMutation.ts`). Trip create/update, expenses, chat and community posts do not yet — see [`docs/BACKLOG.md`](./docs/BACKLOG.md) §3.1 |
+
+### Runtime cache policy
+
+| Cache | Strategy | Retention |
+|---|---|---|
+| `osm-tiles-offline` | CacheFirst | 2000 entries · 30 d |
+| `topo-maps` | CacheFirst | 1000 entries · 30 d |
+| `google-fonts`, `gstatic-fonts` | CacheFirst | 10 entries · 365 d |
+| `wikimedia` | CacheFirst | 300 entries · 30 d |
+| `webllm-runtime` | CacheFirst | 6 entries · 90 d |
+| `supabase-rest` | StaleWhileRevalidate | 200 entries · 1 d |
+| `nominatim`, `nominatim-search` | StaleWhileRevalidate | 100 / 50 entries · 7 d |
+| `opentripmap` | StaleWhileRevalidate | 100 entries · 1 d |
+| `wikipedia` | StaleWhileRevalidate | 100 entries · 7 d |
+| `weather` | NetworkFirst (6 s timeout) | 50 entries · 15 min |
+
+`supabase-rest` holds user-scoped rows, so signing out purges it (`hooks/useAuth.tsx`).
+Anonymous caches — tiles, fonts, Wikipedia — survive logout so the app stays useful offline.
+
+### Manifest
+
+`standalone` display with `minimal-ui`/`browser` fallbacks, portrait orientation, 8 icon sizes
+(192 and 512 marked `any maskable`), 4 app shortcuts (Dashboard, Explore, Itinerary, Profile),
+`handle_links: preferred`, `launch_handler.client_mode: auto`, and an Edge side-panel width.
+
+---
+
+## 🛠️ Tech Stack
+
+### Frontend
+| Technology | Version | Purpose |
+|---|---|---|
+| **React** | 18.3 | UI framework |
+| **TypeScript** | 5.9 | Type safety |
+| **Vite** | 8.2 | Build tool & dev server (Rolldown + Oxc) |
+| **Tailwind CSS** | 3.4 | Utility-first styling |
+| **Radix UI** | latest | Headless primitives (toast, tooltip) |
+| **TanStack Query** | 5.x | Server state caching |
+| **React Router DOM** | 7.18 | Client-side routing (declarative mode) |
+| **Lucide React** | 0.577 | Icon library |
+| **react-markdown** | 10.x | AI response rendering |
+| **Sonner** | 1.7 | Toast notifications |
+
+> **No component library dependency.** The 45 unused shadcn/ui components were removed; only
+> `sonner`, `toast`, `toaster` and `tooltip` remain in `components/ui/`.
+
+### Backend
+| Technology | Purpose |
+|---|---|
+| **Supabase** | PostgreSQL, Auth (PKCE), Realtime, Storage |
+| **PostgreSQL** | Relational store with JSONB columns |
+| **Row-Level Security** | Per-user and per-trip isolation on every table |
+| **Supabase Realtime** | WebSocket subscriptions for live collaboration |
+
+### AI
+| Technology | Purpose |
+|---|---|
+| **Groq — GPT-OSS 120B + Qwen 3.8 27B** | Hosted chat, vision, and transcription through an authenticated server proxy |
+| **WebLLM (`@mlc-ai/web-llm` 0.2.84)** | On-device inference on WebGPU — no key, private, offline |
+| **Web Speech API** | Browser-native STT and TTS — no key, no network |
+| **Groq Whisper** | Optional STT fallback when the deployment has a Groq secret and the user is signed in |
+
+### Maps & geospatial
+Leaflet + React-Leaflet · MapLibre GL JS · OpenStreetMap tiles · OpenRouteService Pelias geocoding and routing.
+
+### External APIs
+| API | Key required | Purpose |
+|---|---|---|
+| **Open-Meteo** | No | 7-day weather forecast |
+| **OpenStreetMap tiles** | No | Map tiles and attribution |
+| **Wikipedia / Wikimedia REST** | No | Place context, imagery, safety advisories |
+| **MyMemory** | No | Translation (1000 req/day per IP) |
+| **WebLLM / MLC** | No | On-device LLM inference (opt-in) |
+| **Groq** | Provider account | Hosted LLM inference through a server-side secret |
+| **OpenRouteService** | Free tier | Authenticated routing, geocoding, ETA, elevation |
+| **OpenTripMap** | Free tier | POI discovery |
+
+The Platform API adds a separate integration layer for MCP-compatible AI clients
+and REST consumers. It uses user-owned, scoped keys and never exposes the
+Supabase service-role credential. See [`docs/PLATFORM_API.md`](./docs/PLATFORM_API.md).
+
+### Removed paid services
+
+These were replaced with free alternatives. The env vars are inert — setting them does nothing.
+
+| Removed | Replaced by |
+|---|---|
+| Amadeus | Deep-links to Google Flights, Kiwi, Skyscanner, Booking.com (`services/amadeus.ts`) |
+| TomTom Traffic | Time-of-day estimation + authenticated OpenRouteService geocoding/routing (`services/traffic.ts`) |
+| Mappls Web Maps SDK | OpenStreetMap + MapLibre GL |
+| GNews *(key was hardcoded in source)* | Wikipedia REST + curated advisories (`services/gnews.ts`) |
+| OpenAI GPT-4o | Groq GPT-OSS 120B for chat; Qwen 3.8 27B for vision |
+
+> `services/traffic.ts` still exports functions named `tomtomSearch`, `tomtomNearbySearch` and so
+> on. These are compatibility shims over free providers, kept so existing callers didn't need to
+> change — the names are historical, not an indication of a TomTom dependency. The same applies to
+> `services/gemini.ts`, which targets Groq.
+
+### DevOps
+Vite PWA Plugin + Workbox · Vitest + Testing Library · ESLint 9 (flat config) · TypeScript strict.
+
+---
+
+## 🏗️ Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│    Atlas AI     │
+└──────────────────────────────────────────────────────────────┘
+                             │
+      ┌──────────────────────┼──────────────────────┐
+      │                      │                      │
+┌─────▼──────┐      ┌────────▼───────┐     ┌────────▼────────┐
+│  React 18  │      │    Supabase    │     │  Groq GPT-OSS   │
+│ Vite 8 /TS │      │ Postgres + RLS │     │  3.3 70B (JSON  │
+│  PWA shell │      │  + Realtime    │     │      mode)      │
+└─────┬──────┘      └────────┬───────┘     └────────┬────────┘
+      │                      │                      │
+┌─────▼──────────────────────▼──────────────────────▼─────────┐
+│                       Feature Modules                        │
+│                                                              │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐                │
+│  │ Itinerary │  │  Maps &   │  │  Group    │                │
+│  │  AI Plan  │  │  Routing  │  │  Social   │                │
+│  └───────────┘  └───────────┘  └───────────┘                │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐                │
+│  │  Weather  │  │  Finance  │  │  Safety   │                │
+│  │  Traffic  │  │  Expenses │  │   SOS     │                │
+│  └───────────┘  └───────────┘  └───────────┘                │
+└──────────────────────────────────────────────────────────────┘
+      │
+┌─────▼──────────────────────────────────────────────────────┐
+│  Offline layer — Workbox SW · IndexedDB · OSM tile cache   │
+└────────────────────────────────────────────────────────────┘
+```
+
+### Voice-to-itinerary flow
+
+```
+Speech  →  Web Speech API (in-browser STT)
+              │  └─ optional: Groq Whisper when the server secret is set
+              ▼
+        Groq GPT-OSS (JSON mode)
+              │
+              ▼
+        { destination, start_date, end_date, travelers,
+          budget_total, interests[], trip_type }
+              │
+              ▼
+        Plan generation  →  regret scoring  →  lowest-max-regret variant
+              │
+              ▼
+        Supabase (itineraries + activities)
+              │
+              ▼
+        Supabase Realtime  →  every group member updates live
+```
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+- **Node.js ≥ 20.19** (enforced via `engines` in `package.json`)
+- **npm ≥ 10**
+- A **Supabase** project (free tier is enough)
+
+### Installation
+
+```bash
+git clone https://github.com/HarshTambade/Radiator-Routes.git
+cd Radiator-Routes
+
+npm install
+
+cp .env.example .env
+# Fill in VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY at minimum
+
+# Create the schema: paste supabase/master_schema.sql into the Supabase SQL Editor
+npm run dev
+```
+
+The dev server runs on **http://localhost:8080**.
+
+> The Supabase client **throws on startup in dev** if its two required variables are missing —
+> the failure is immediate and explicit rather than a confusing runtime error later.
+
+### Verifying the PWA locally
+
+The service worker is disabled in dev (`devOptions.enabled: false`). To exercise it:
+
+```bash
+npm run build && npm run preview
+```
+
+Then in DevTools → Application: confirm the worker is active, install the app, and tick
+**Network → Offline** to test offline routes.
+
+---
+
+## 🔐 Environment Variables
+
+Only the Supabase pair is required. See `.env.example` for the annotated source of truth.
+
+```env
+# ── Required ────────────────────────────────────────────────────────────
+VITE_SUPABASE_URL="https://your-project.supabase.co"
+VITE_SUPABASE_PUBLISHABLE_KEY="your-publishable-key"
+
+```
+
+Provider credentials are stored as Supabase Edge Function secrets and are only
+used by authenticated, quota-limited server proxies:
+
+```sh
+supabase secrets set GROQ_API_KEY="..." ORS_API_KEY="..." OPENTRIPMAP_API_KEY="..."
+```
+
+For browser-based REST or MCP clients, allow only the exact production origins
+that should use the API. Requests from server-side clients without an `Origin`
+header remain supported:
+
+```sh
+supabase secrets set PLATFORM_API_ALLOWED_ORIGINS="https://app.example.com"
+```
+
+Set `HF_API_KEY` if the `ai-planner` itinerary endpoint is enabled. `GROQ_MODEL`
+and `GROQ_VISION_MODEL` are optional server-side model overrides. No provider
+key is needed for Open-Meteo, OpenStreetMap tiles, MapLibre, Wikimedia, or the
+on-device WebLLM path. Geocoding uses the authenticated OpenRouteService proxy.
+
+> ⚠️ Every `VITE_*` variable is **inlined into the client bundle** and is therefore public by
+> design. Never put a service-role key, provider credential, or any key that can
+> spend money in a `VITE_*` variable. If an earlier deployment used a provider
+> key in a `VITE_*` variable, rotate that provider key after moving it to Edge
+> Function secrets. Supabase Row-Level Security, server-side owner checks, and
+> per-user/project quotas protect data and provider usage.
+
+---
+
+## 📁 Project Structure
+
+```
+Radiator-Routes/
+├── public/                      # Icons, favicons, robots.txt
+├── src/
+│   ├── assets/                  # Destination & hero imagery
+│   ├── components/
+│   │   ├── ui/                  # sonner · toast · toaster · tooltip (only)
+│   │   ├── AIAssistant.tsx      # Jinny voice + chat assistant
+│   │   ├── AIProviderSettings.tsx # Groq vs on-device picker + model manager
+│   │   ├── ARViewer.tsx         # AR attraction overlay (lazy)
+│   │   ├── AccessibilityPanel.tsx
+│   │   ├── AppSidebar.tsx
+│   │   ├── CollaborativePlanner.tsx
+│   │   ├── DisruptionReplanner.tsx
+│   │   ├── ErrorBoundary.tsx    # Chunk-load-aware root boundary
+│   │   ├── ItineraryNotifications.tsx
+│   │   ├── ItineraryReasoning.tsx
+│   │   ├── LanguageSwitcher.tsx
+│   │   ├── LiveLocationPanel.tsx
+│   │   ├── Map3D.tsx            # MapLibre GL globe (lazy)
+│   │   ├── MobileHeader.tsx
+│   │   ├── MobileNav.tsx
+│   │   ├── OfflineIndicator.tsx # Connectivity banner + update prompt
+│   │   ├── OfflineSaveButton.tsx
+│   │   ├── PWAInstallPrompt.tsx # Android prompt + iOS instructions
+│   │   ├── ProtectedLayout.tsx
+│   │   ├── ProtectedRoute.tsx
+│   │   ├── RegretPlanner.tsx
+│   │   ├── SOSPanel.tsx
+│   │   ├── SafetyWarnings.tsx
+│   │   ├── StreetView360.tsx    # (lazy)
+│   │   ├── TravelMemory.tsx
+│   │   ├── TripCreationChat.tsx
+│   │   ├── TripMoneyExpenses.tsx
+│   │   ├── UPIPayment.tsx
+│   │   └── WorldMap.tsx         # Leaflet 2D map
+│   │
+│   ├── hooks/
+│   │   ├── useAuth.tsx          # Session + sign-out cache purge
+│   │   ├── useLanguage.tsx
+│   │   ├── useGroupPreferences.ts # Real trip members + their preferences
+│   │   ├── useOfflineSync.ts    # Drains the mutation queue on reconnect
+│   │   ├── useOfflineStorage.ts # SW update detection + cache pruning
+│   │   ├── useOfflineTrip.ts    # Save/remove trips offline, useOnlineStatus
+│   │   ├── useTrips.tsx
+│   │   └── use-toast.ts
+│   │
+│   ├── integrations/supabase/
+│   │   ├── client.ts            # Env-only credentials, no hardcoding
+│   │   └── types.ts             # Generated DB types
+│   │
+│   ├── lib/
+│   │   ├── aiProvider.ts        # Backend choice, model list, WebGPU probe
+│   │   ├── currency.ts          # ₹ INR + multi-currency formatting
+│   │   ├── groupRegret.ts       # Utilities + Least Misery scoring
+│   │   ├── itineraryVerifier.ts # Deterministic feasibility checks
+│   │   ├── offlineMutation.ts   # Queue-on-failure writes + FIFO replay
+│   │   ├── date.ts
+│   │   ├── errors.ts            # Shared error taxonomy
+│   │   ├── http.ts              # Fetch wrapper: timeout, retry, JSON
+│   │   ├── iata.ts              # City → IATA lookup
+│   │   ├── idb.ts               # Typed IndexedDB wrapper (6 stores)
+│   │   ├── offlineCache.ts      # TTL cache over IndexedDB
+│   │   └── utils.ts
+│   │
+│   ├── pages/                   # 12 route components, all lazy-loaded
+│   ├── services/                # 15 external-API modules
+│   ├── test/
+│   ├── App.tsx                  # Routing + providers + ErrorBoundary
+│   ├── main.tsx
+│   └── index.css
+│
+├── supabase/
+│   ├── migrations/              # 14 incremental migrations
+│   ├── functions/
+│   ├── master_schema.sql        # Idempotent full schema
+│   └── SETUP_INSTRUCTIONS.md
+│
+├── index.html
+├── vite.config.ts               # Build, chunking, PWA manifest & Workbox
+├── vitest.config.ts
+├── tailwind.config.ts
+├── eslint.config.js
+├── vercel.json                  # SPA rewrites
+└── package.json
+```
+
+---
+
+## 🗺️ Pages & Routing
+
+Every page is `React.lazy()`-loaded, so each ships as its own chunk.
+
+| Route | Page | Access |
+|---|---|---|
+| `/` | `Landing.tsx` | Public |
+| `/auth` | `Auth.tsx` | Public |
+| `/join/:inviteCode` | `JoinTrip.tsx` | Public |
+| `/dashboard` | `Dashboard.tsx` | Protected |
+| `/itinerary` | `Itinerary.tsx` | Protected |
+| `/itinerary/:tripId` | `Itinerary.tsx` | Protected |
+| `/explore` | `Explore.tsx` | Protected |
+| `/guide` | `Guide.tsx` | Protected |
+| `/friends` | `Friends.tsx` | Protected |
+| `/community` | `Community.tsx` | Protected |
+| `/profile` | `Profile.tsx` | Protected |
+| `/integrations` | `Integrations.tsx` | Protected — API keys, MCP setup, REST/OpenAPI docs |
+| `*` | `NotFound.tsx` | Public |
+
+Protected routes sit behind `ProtectedLayout`, which redirects unauthenticated users to `/auth`.
+
+---
+
+## 🔌 Services Reference
+
+| Module | Provider | Key | Notes |
+|---|---|---|---|
+| `gemini.ts` | Groq **or** WebLLM | Optional | Provider dispatch — name is historical |
+| `webllm.ts` | WebLLM (WebGPU) | No | On-device engine, model cache, streaming |
+| `webllmWorker.ts` | WebLLM (WebGPU) | No | Worker host so inference doesn't block the UI |
+| `aiChat.ts` | Groq **or** WebLLM | Optional | Streaming chat + intent classification |
+| `aiPlanner.ts` | via `gemini.ts` | Optional | Itinerary generation, JSON mode |
+| `dynamicReplan.ts` | via `gemini.ts` | Optional | Disruption-driven replanning |
+| `travelMemory.ts` | via `gemini.ts` | Optional | Cross-trip preference learning |
+| `groqVoice.ts` | Web Speech API | No | Groq Whisper only as fallback |
+| `climate.ts` | Open-Meteo | No | 7-day forecast, WMO code mapping |
+| `nominatim.ts` | OpenRouteService Pelias | Server secret | Compatibility adapter over authenticated geocoding proxy |
+| `openroute.ts` | OpenRouteService | Server secret | Authenticated Edge Function proxy |
+| `opentripmap.ts` | OpenTripMap | Server secret | Authenticated Edge Function proxy |
+| `traffic.ts` | Local estimates + ORS | Server secret | Time-of-day traffic estimation and proxied routing/geocoding |
+| `amadeus.ts` | Deep-links | No | Google Flights, Kiwi, Skyscanner, Booking.com |
+| `gnews.ts` | Wikipedia REST | No | Place context + curated advisories |
+| `translate.ts` | MyMemory | No | Falls back to source text on error |
+| `offlineTrip.ts` | IndexedDB + Cache API | No | Trip persistence + OSM tile pre-caching |
+| `platformApi.ts` | Supabase Edge Function | User session | Creates/lists/revokes scoped integration keys |
+
+Network calls go through `lib/http.ts`, which centralises timeout, retry and JSON handling, and
+`lib/errors.ts`, which normalises failures into a single taxonomy.
+
+---
+
+## 🗄️ Database Schema
+
+PostgreSQL via Supabase with **Row-Level Security on every table**.
+
+### Core
+| Table | Description |
+|---|---|
+| `profiles` | User profile, avatar, bio, travel preferences (JSONB) |
+| `trips` | Destination, dates, budget, status, organiser |
+| `trip_memberships` | users ↔ trips with `organizer` / `member` roles |
+| `itineraries` | Versioned AI-generated itineraries per trip |
+| `activities` | Day-by-day activities within an itinerary. `opening_hours` (JSONB) feeds the verifier's closed-day and outside-hours checks; `updated_at` is the concurrency stamp the offline queue matches on when replaying a queued edit |
+| `activity_votes` | Per-member up/down votes |
+| `messages` | Per-trip group chat |
+| `disruption_events` | User-reviewed weather forecast concerns and accepted replan history |
+
+### Social & invites
+`trip_invites` · `trip_join_requests` · `friend_requests` · `direct_messages`
+
+### Finance
+`group_expenses` · `expense_splits`
+
+### Community
+`communities` · `community_memberships` · `community_messages` · `community_events` · `event_rsvps`
+
+### External integrations
+`integration_api_keys` (hash-only keys, scopes, expiry and revocation) ·
+`integration_api_rate_limits` (atomic per-key limits) ·
+`travel_orders` (idempotent booking request records; no payment data)
+
+See [`docs/PLATFORM_API.md`](./docs/PLATFORM_API.md) for API and MCP setup.
+
+### Status constraints
+
+```sql
+CHECK (trips.status              IN ('planning','booked','ongoing','completed'))
+CHECK (trip_join_requests.status IN ('pending','approved','rejected'))
+CHECK (friend_requests.status    IN ('pending','accepted','rejected'))
+CHECK (event_rsvps.status        IN ('going','maybe','not_going'))
+```
+
+### Helper functions
+
+```sql
+public.is_trip_member(trip_id UUID)    → BOOLEAN
+public.is_trip_organizer(trip_id UUID) → BOOLEAN
+public.set_updated_at()                → TRIGGER
+```
+
+### Realtime publication
+
+`messages` · `activity_votes` · `community_messages` · `trip_join_requests` ·
+`direct_messages` · `friend_requests` · `group_expenses` · `expense_splits`
+
+---
+
+## ⚙️ Supabase Setup
+
+### Option 1 — master schema (recommended)
+
+Supabase Dashboard → SQL Editor → New Query → paste all of `supabase/master_schema.sql` → Run.
+The script is idempotent, so it is safe to re-run against an existing database.
+
+### Option 2 — incremental migrations
+
+```bash
+supabase db push
+```
+
+Or run the 14 files in `supabase/migrations/` in filename order. `20260222000002_*` fixes the
+`trip_join_requests` status constraint and must not be skipped.
+
+### Auth
+
+Authentication → Providers → enable **Email**. Set the Site URL to your deployment origin and add
+`http://localhost:8080/**` as a redirect URL for local development. The client uses the **PKCE**
+flow with session persistence and automatic token refresh.
+
+### Extensions
+
+```sql
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";   -- gen_random_bytes for invite codes
+```
+
+### Verify Realtime
+
+```sql
+SELECT schemaname, tablename
+FROM pg_publication_tables
+WHERE pubname = 'supabase_realtime';
+```
+
+---
+
+## 📦 Available Scripts
+
+| Script | Description |
+|---|---|
+| `npm run dev` | Dev server on `:8080` |
+| `npm run build` | Type-check then production build |
+| `npm run build:dev` | Development-mode build with sourcemaps |
+| `npm run preview` | Serve `dist/` on `:8080` — use this to test the service worker |
+| `npm run typecheck` | `tsc --noEmit` only |
+| `npm run lint` | ESLint |
+| `npm run lint:fix` | ESLint with autofix |
+| `npm run lint:ci` | ESLint with a warning ceiling |
+| `npm run test` | Vitest, single run |
+| `npm run test:watch` | Vitest in watch mode |
+| `npm run verify` | typecheck → lint → test → build |
+| `npm run clean` | Remove `dist`, `dev-dist`, Vite cache |
+
+> **Use npm.** `bun.lockb`, `yarn.lock`, `pnpm-lock.yaml` and `pnpm-workspace.yaml` were removed —
+> four competing lockfiles meant two CI environments could resolve different dependency trees from
+> the same commit. `packageManager` is pinned in `package.json`.
+
+---
+
+## 📊 Build & Bundle Budget
+
+`npm run build` output on the current tree:
+
+| Chunk | Raw | Loaded |
+|---|---|---|
+| `index` | 173 kB | initial |
+| `vendor-react` | 140 kB | initial |
+| `vendor-supabase` | 209 kB | initial |
+| `vendor-router` | 39 kB | initial |
+| `vendor-query` | 33 kB | initial |
+| `vendor-webllm` | 5.9 MB | **lazy + precache-excluded** — only when on-device AI is enabled |
+| `webllmWorker` | 5.9 MB | **lazy + precache-excluded** — worker bundles its own copy |
+| `vendor-maplibre` | 787 kB | **lazy** — only on 3D map |
+| `vendor-pdf` | 658 kB | **preloaded — see the discrepancy below** |
+| `vendor-leaflet` | 160 kB | lazy — 2D map |
+| `vendor-markdown` | 115 kB | initial — `ProtectedLayout` → `AIAssistant` → `react-markdown` is a static chain |
+| `Itinerary` | 143 kB | lazy — per route |
+
+#### Measured first load, and a discrepancy worth fixing
+
+The figure previously published here was **≈171 kB gzipped**. Measuring what `dist/index.html`
+actually asks the browser to fetch does not support that number. The document contains one entry
+`<script>`, one stylesheet and 16 `<link rel="modulepreload">` hints — and `modulepreload`
+*downloads*, it does not merely hint. Summing those 18 files gzipped:
+
+```
+gzip -9 of every asset referenced by dist/index.html  →  ~540 kB
+```
+
+Two entries in that list deserve scrutiny:
+
+| Chunk | Gzipped | Should it be there? |
+|---|---|---|
+| `vendor-pdf` | ~188 kB | **No.** `jspdf` and `jspdf-autotable` are imported *only* dynamically, inside the export click handler in `pages/Itinerary.tsx`. Nothing in `src/` imports them statically, yet the chunk is still preloaded. |
+| `vendor-markdown` | ~34 kB | Arguably. `App.tsx` statically imports `ProtectedLayout`, which pulls in `AIAssistant` and therefore `react-markdown`. Legitimate given the current import graph, but `ProtectedLayout` could be lazy. |
+
+`vendor-pdf` alone is roughly 35% of first load, spent on a feature most visitors never touch. The
+likely cause is that Rolldown's `advancedChunks` grouping emits preload hints for grouped chunks
+regardless of whether the import that reaches them is static or dynamic — Vite 8's Rolldown
+pipeline is new, and the older esbuild/Rollup behaviour of preloading only the static graph does not
+appear to hold. **This is an open bug, not a documented trade-off.** Tracked in
+[`docs/BACKLOG.md`](./docs/BACKLOG.md).
+
+Excluding the two chunks above, first load is ~319 kB gzipped. The honest summary is therefore:
+code-splitting cut the payload substantially from the ~749 kB starting point, but the 171 kB figure
+was measuring a subset of the critical path — core JS only, without CSS, icons, Radix, the route
+chunk or the preload hints — rather than what a browser actually downloads.
+
+MapLibre, Leaflet and the WebLLM chunks *are* genuinely lazy and were verified absent from the
+preload list.
+
+The two WebLLM chunks total ~11.7 MB and are handled specially: excluded from the service-worker
+precache via `globIgnores`, then cached by a runtime `CacheFirst` rule after first use. Without
+that exclusion the PWA install cost would jump from ~4.7 MB to 16 MB for every visitor, including
+the majority who never enable on-device AI. Verify with the precache line in `npm run build`
+output — it should read ~4.7 MB.
+
+Chunking is declared via `build.rolldownOptions.output.advancedChunks.groups` in
+`vite.config.ts`. Vite 8 uses **Rolldown + Oxc**, not esbuild or Rollup, so the older
+`manualChunks` function form does not apply.
+
+Two chunks exceed the 700 kB warning threshold. Both are single third-party libraries that cannot
+be split further. `vendor-maplibre` is genuinely lazy; `vendor-pdf` is the preload bug described
+above and is the one to fix.
+
+---
+
+## 🔒 Security
+
+- **`npm audit`: 0 vulnerabilities** across 882 packages
+- **No hardcoded credentials in `src/`** — verified by scanning for JWT, `sk-` and `gsk_` patterns
+- **Supabase credentials come from env only**, with a loud dev-time failure when absent
+- **PKCE auth flow** with session persistence and auto-refresh
+- **Row-Level Security on every table** — the browser holds only a publishable key
+- **No sourcemaps in production** (`sourcemap: !isProd`)
+- **User-scoped caches purged on sign-out** so cached rows don't leak across sessions on a shared device
+- **Runtime deps reduced 57 → 20**, and 45 unused UI components removed, shrinking the attack surface
+
+### Prompt privacy
+
+On the default Groq backend, prompts — including trip details, dates and any personal context
+`aiChat.ts` loads from your profile — are sent to Groq's API. Switching to the on-device engine
+keeps every prompt local: after the one-time weight download, WebLLM makes no network calls, so no
+travel data leaves the browser. That is the stronger option for privacy-sensitive use, at the cost
+of speed and model quality.
+
+Model weights are fetched from the MLC/HuggingFace CDN on first download. Deliberately **not**
+routed through Workbox — WebLLM manages its own weight cache, and double-caching multiple
+gigabytes would waste the storage quota.
+
+### Client-side key exposure
+
+All `VITE_*` variables are compiled into the JavaScript bundle and are readable by anyone. This is
+inherent to a browser-only app, not a defect. Consequently:
+
+- Only publishable/anon keys belong in `VITE_*`
+- Restrict every free-tier key by HTTP referrer in its provider dashboard
+- Treat Row-Level Security as the actual authorisation boundary
+- Move any key that must stay secret behind a Supabase Edge Function
+
+A full findings list, including open items, is in [`AUDIT.md`](./AUDIT.md).
+
+---
+
+## 🛣️ Roadmap
+
+Grounded in what the code does today. Full detail, with file-level evidence, in
+[`docs/BACKLOG.md`](./docs/BACKLOG.md).
+
+```mermaid
+gantt
+    title Atlas AI — delivery roadmap
+    dateFormat YYYY-MM-DD
+    axisFormat %b
+    section Shipped
+    Security & dependency hardening      :done, s1, 2026-08-01, 10d
+    Code splitting from 749 kB           :done, s2, 2026-08-08, 7d
+    Offline reads, tiles, PWA install    :done, s3, 2026-08-12, 10d
+    On-device AI via WebLLM              :done, s4, 2026-08-22, 6d
+    Computed fairness + plan verifier    :done, s5, 2026-08-28, 3d
+    Offline write queue wired            :done, s6, 2026-08-30, 2d
+    Preference elicitation UI            :done, s7, 2026-08-31, 2d
+    Verifier repair loop                 :done, s8, 2026-08-31, 1d
+    Opening-hours constraint             :done, s9, 2026-08-31, 1d
+    section Now
+    Measure it — no results exist yet    :active, n1, 2026-09-01, 14d
+    Extend offline writes beyond activities :n2, 2026-09-01, 14d
+    section Next
+    Votes feed the utility model         :x1, after n2, 12d
+    Concurrency beyond last-write-wins   :x2, after n2, 10d
+    Connectivity-aware degradation       :x3, after n1, 10d
+    section Later
+    Merge the two IndexedDB stores       :l1, after x1, 7d
+    Defer Supabase off first paint       :l2, after x1, 5d
+    Type external API responses          :l3, after x1, 14d
+    Real-device + Lighthouse benchmarks  :l4, after x3, 7d
+```
+
+### Phase detail
+
+| Phase | Goal | Exit criteria |
+|---|---|---|
+| **Shipped** | Production hygiene, offline reads and writes, on-device AI, honest metrics, generate–verify–repair | 0 vulns · 228 tests · verifier (14 checks) + repair loop + computed Least Misery + preference UI live |
+| **Now** | Measure what has been built | Load time, tokens/sec and GPU memory from a real WebGPU session; repair-loop success rate on a held-out prompt set; offline writes extended past activity edits |
+| **Next** | Close the remaining correctness gaps | Revealed votes refine utilities; concurrent edits stop being last-write-wins; the planner adapts strategy to observed connectivity |
+| **Later** | Performance and typing | One IndexedDB store · Supabase off the critical path · API responses typed · Lighthouse and on-device benchmarks published |
+
+> **The honest state of it.** Everything in *Shipped* exists and is tested. Nothing in it has been
+> *evaluated* — there is no measured evidence that the repair loop improves plan quality, or that
+> computed regret tracks actual member satisfaction. Building a mechanism and demonstrating it works
+> are different claims, and only the first has been earned. See
+> [`docs/RESEARCH.md`](./docs/RESEARCH.md) §8.3 for the evaluation protocol that would settle it.
+
+### Known gaps, stated plainly
+
+| Gap | Status |
+|---|---|
+| **Nothing is evaluated** | The verifier, repair loop and fairness score all work and are unit-tested. Whether they *improve outcomes* is unmeasured. **Top priority** — it is the difference between a mechanism and a result. |
+| **Offline writes cover only some paths** | Activity status and edits queue and replay. Trip create/update, expenses, chat and community posts still write directly and fail offline. |
+| **Replay is last-write-wins** | `activities.updated_at` now lets a replay reject a stale write, so a silent overwrite becomes a visible rejection. Genuine merge of concurrent edits is still not attempted. |
+| **Opening-hours data is model-sourced** | The checks work, but `activities.opening_hours` is currently written by the model and tagged `source: "model"`, so findings only *warn* rather than block. Unknown hours are treated as unverifiable, not as closed. Backfilling authoritative hours from OSM/Overpass would let these become hard errors — see [`docs/BACKLOG.md`](./docs/BACKLOG.md) §3.5. |
+| **`vendor-pdf` ships on first load** | ~188 kB gzipped is preloaded for a dynamic-only import. An open bundling bug, not a trade-off — [`docs/BACKLOG.md`](./docs/BACKLOG.md) §3.10. |
+| **On-device performance unmeasured** | Load time, tokens/sec and GPU memory need a real WebGPU session. None of it is benchmarked. |
+| **Repair is single-pass** | One retry, by design — the literature suggests most of the benefit arrives on the first re-prompt ([Stechly et al.](https://arxiv.org/abs/2402.08115)). Not verified for this domain. |
+| **On-device vision degrades silently** | `AccessibilityPanel` sends image-description prompts through the shared dispatch; all six curated on-device models are text-only. |
+
+---
+
+## 📚 Documentation
+
+| Document | What it answers |
+|---|---|
+| [`README.md`](./README.md) | How do I run and understand this? |
+| [`docs/REPORT.md`](./docs/REPORT.md) | **Project report** — problem, architecture, the three technical contributions, results, and an explicit account of what is *not* verified |
+| [`AUDIT.md`](./AUDIT.md) | What was measured, and what was found wrong? |
+| [`docs/RESEARCH.md`](./docs/RESEARCH.md) | What is genuinely novel against prior art? |
+| [`docs/RESEARCH_PAPER.md`](./docs/RESEARCH_PAPER.md) | Structured research-paper manuscript, research questions, evaluation protocol, metrics, and reproducibility checklist |
+| [`docs/PATENT_DISCLOSURE.md`](./docs/PATENT_DISCLOSURE.md) | Technical invention disclosure for patent counsel; not a legal opinion or filing-ready application |
+| [`docs/README.md`](./docs/README.md) | Documentation map, evidence policy, naming conventions, and publication guidance |
+| [`docs/BACKLOG.md`](./docs/BACKLOG.md) | What is broken, and what is the fix? |
+
+### Research & prior art
+
+[`docs/RESEARCH.md`](./docs/RESEARCH.md) is a research dossier covering prior art, novelty analysis
+and a publication plan: 16 related patents, ~60 papers, mind maps of the research landscape, and a
+gap analysis of what is implemented versus what is not.
+
+Three things in it are worth knowing before reading the feature list above:
+
+- **LLM-generated itineraries are unreliable under multiple constraints.** On the TravelPlanner
+  benchmark, GPT-4 reaches a 0.6% success rate ([Xie et al.](https://arxiv.org/abs/2402.01622)) —
+  agents lose track of exactly the kind of constraint set a group trip is made of. This is the whole
+  reason a deterministic verifier exists here.
+- **Self-critique does not fix it; external verification does.** Asking a model to check its own plan
+  degrades performance, while a sound external verifier that simply re-prompts recovers most of the
+  benefit ([Stechly et al.](https://arxiv.org/abs/2402.08115)). `lib/itineraryVerifier.ts` plus
+  `lib/planRepair.ts` is that shape deliberately, and it puts the design in the LLM-Modulo family
+  ([Kambhampati et al.](https://arxiv.org/abs/2402.01817)).
+- **The "regret score" used to be fabricated.** `services/aiPlanner.ts` once prescribed the value in
+  the prompt and the UI rendered it as a metric. That is documented in §3.2 of the dossier and has
+  since been replaced with computed Least Misery in `lib/groupRegret.ts`.
+
+---
+
+## 🚢 Deployment
+
+### Vercel
+
+`vercel.json` already contains the SPA rewrites.
+
+```bash
+npm i -g vercel
+vercel --prod
+```
+
+Add every variable from [Environment Variables](#-environment-variables) under
+**Project Settings → Environment Variables**.
+
+### Netlify
+
+```bash
+# Build:   npm run build
+# Publish: dist
+echo "/*  /index.html  200" > public/_redirects
+```
+
+### Docker
+
+```dockerfile
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+```
+
+### PWA notes
+
+Serve over HTTPS — service workers require a secure context (`localhost` is exempt). With
+`registerType: "autoUpdate"`, a new deploy is picked up on the next visit; `OfflineIndicator`
+surfaces a reload prompt when a worker is waiting. Make sure your host does not long-cache
+`sw.js` or clients will be pinned to a stale worker.
+
+---
+
+## 🤝 Contributing
+
+```bash
+git checkout -b feat/your-feature
+# ... make changes ...
+npm run verify          # typecheck + lint + test + build
+git commit -m "feat: add voice command shortcuts"
+git push origin feat/your-feature
+```
+
+### Guidelines
+
+- **TypeScript** — avoid `any`; prefer `unknown` plus narrowing
+- **Components** — function components with hooks
+- **Naming** — PascalCase components, camelCase hooks and utilities
+- **Styling** — Tailwind utilities; no inline styles except genuinely dynamic values
+- **Network** — route new calls through `lib/http.ts`
+- **Database** — every new table needs RLS policies
+- **Keys** — browser `VITE_*` values are public; provider secrets belong in Supabase Edge Function secrets
+- **Offline** — new heavy third-party origins need a runtime caching rule in `vite.config.ts`
+
+`npm run verify` must pass before a PR.
+
+### Key technical decisions
+
+| Decision | Rationale |
+|---|---|
+| **Supabase over Firebase** | Relational integrity, RLS, SQL expressiveness |
+| **Groq over OpenAI** | Generous free tier, no card, OpenAI-compatible API |
+| **WebLLM as an alternative backend** | Removes the API-key requirement entirely, keeps prompts on-device, and makes AI work offline — for users who accept smaller models |
+| **Dispatch inside `gemini.ts`** | One choke point; the four AI services and the accessibility panel needed no changes |
+| **WebLLM in a Worker, excluded from precache** | Keeps the UI responsive during generation and keeps 11.7 MB off every visitor's first load |
+| **Web Speech API over hosted STT** | Zero cost, zero latency, no audio leaves the device |
+| **Vite 8 / Rolldown** | Faster builds; declarative priority-based chunking |
+| **Route-level `lazy()`** | Landing visitors don't download the planner, maps or PDF engine |
+| **Open-Meteo and OpenStreetMap tiles** | Public services with usage policies; ORS geocoding/routing needs a server credential |
+| **`generateSW` over `injectManifest`** | Declarative caching config; no service-worker source to maintain |
+
+---
+
+## 📄 License
+
+MIT — see [`LICENSE`](./LICENSE), which also carries third-party notices.
+
+The MIT grant covers this project's **source code only**. It does not grant rights to third-party
+data or model weights: OpenStreetMap data is ODbL, Open-Meteo is CC BY, Wikipedia is CC BY-SA, and
+each on-device model carries its own upstream licence (Llama Community, Qwen, Microsoft Research).
+Review the licence of any model you enable before commercial use.
+
+```
+MIT License · Copyright (c) 2026 Harsh Tambade
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## 🙏 Acknowledgements
+
+[Groq](https://groq.com) · [Supabase](https://supabase.com) ·
+[Open-Meteo](https://open-meteo.com) · [OpenStreetMap](https://www.openstreetmap.org) ·
+[OpenRouteService](https://openrouteservice.org) · [OpenTripMap](https://opentripmap.io) ·
+[Wikipedia & Wikimedia](https://www.wikipedia.org) · [MapLibre](https://maplibre.org) ·
+[Leaflet](https://leafletjs.com) · [Radix UI](https://www.radix-ui.com) ·
+[Lucide](https://lucide.dev) · [Workbox](https://developer.chrome.com/docs/workbox) ·
+[Vite](https://vite.dev)
+
+Map data © OpenStreetMap contributors, available under the
+[Open Database License](https://www.openstreetmap.org/copyright).
+
+---
+
+<div align="center">
+
+Made with ❤️ in India 🇮🇳
+
+**[⭐ Star this repo](https://github.com/HarshTambade/Radiator-Routes)**
+
+</div>
